@@ -1,0 +1,6 @@
+# LLM_Game v2 코어 스택 (설계 근거: docs/DISCUSSION.md §8)
+# LangChain·LangGraph 없음 — OpenAI SDK 직접(§8-4).
+pydantic>=2.0        # 스키마·구조화출력 검증
+openai>=1.40         # LLM 호출 (structured output: chat.completions.parse)
+python-dotenv>=1.0   # .env 로드 (루트 .env)
+streamlit>=1.30      # 단일 앱 UI
