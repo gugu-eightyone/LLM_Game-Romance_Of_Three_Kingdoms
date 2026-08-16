@@ -5,6 +5,10 @@
 .venv
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # 작업 중 자투리 파일들
 .vscode

@@ -4,3 +4,4 @@ pydantic>=2.0        # 스키마·구조화출력 검증
 openai>=1.40         # LLM 호출 (structured output: chat.completions.parse)
 python-dotenv>=1.0   # .env 로드 (루트 .env)
 streamlit>=1.30      # 단일 앱 UI
+pytest>=8.0          # 규칙 엔진 단위 테스트 (Phase 2에서 승격)

@@ -27,23 +27,40 @@ class City(BaseModel):
     troops: int = 0          # 순수 int: 음수 탐지는 B층이 담당(여기서 clamp/raise 안 함)
     food: int = 0
     gold: int = 0
-    generals: list[str] = Field(default_factory=list)  # 주둔 장수
+    wall: int = 0            # 성벽 레벨: 공성 수비 보정(내정 성벽보수로 증가)
+    generals: list[str] = Field(default_factory=list)  # 주둔 장수(로스터 이름 참조)
 
 
 class Faction(BaseModel):
     name: FactionName
     ruler: str                                   # 군주 이름 = 참수(패배) 대상
+    capital: str = ""                            # 군주 위치 = 수도. 함락 시 이동/포획 판정 기준
     morale: int = Field(default=50, ge=0, le=100)  # 민심: 하드 바운드(항상 클램프되는 값)
     prisoners: list[str] = Field(default_factory=list)
     alive: bool = True                           # 군주 참수 시 False → 세력 소멸
 
 
+class General(BaseModel):
+    """장수 로스터(정적). 린하게 2숫자만 — 무력=전투보정, 지력=계략보정. [[DISCUSSION#9-9]]"""
+    name: str
+    might: int = 50          # 무력
+    intel: int = 50          # 지력
+
+
 class ActiveOperation(BaseModel):
-    """엔진이 굴리는 다-달 작전 상태. Action(의도) + 진행도(코드 소유)."""
+    """엔진이 굴리는 다-달 작전 상태. Action(의도) + 진행도(코드 소유).
+
+    2단계 생애주기: 이동(거리 기반) → 교전(병력·전략 기반) → 해소. [[DISCUSSION#9-9]]
+    """
+    id: int                                      # ③ seam: 야전 요격이 이 작전을 콕 집게(증분2 수용)
+    faction: FactionName                         # 작전 주체(출발도시 소유 세력)
     action: "Action"
-    progress: int = 0
-    threshold: int                               # 진행도 ≥ threshold → 해소(함락 등)
+    stage: Literal["이동", "교전"] = "이동"       # 작전 국면. 도착 시 이동→교전 전환
+    progress: float = 0                          # float: 세력별 진군속도(오 1.25×)가 소수 진척 → 잉여 이월
+    threshold: float                             # 진행도 ≥ threshold → 국면 전환/해소
+    prep: float = 0                              # 조기도착 잉여(개월). 오만 >0 → 첫 교전 준비보정(토루). [[DISCUSSION#9-9]]
     committed_troops: int = 0                     # 검증·클램프된 실제 투입
+    committed_generals: list[str] = Field(default_factory=list)  # 검증된 동행 장수
 
 
 class GameState(BaseModel):
@@ -52,6 +69,13 @@ class GameState(BaseModel):
     cities: dict[str, City] = Field(default_factory=dict)
     factions: dict[str, Faction] = Field(default_factory=dict)
     operations: list[ActiveOperation] = Field(default_factory=list)
+    # --- 정적 세계 데이터(게임 중 불변). 시나리오에서 로드, State에 함께 실어 다님 ---
+    distances: dict[str, dict[str, int]] = Field(default_factory=dict)  # 인접·거리(개월): city→neighbor→months
+    river_edges: list[tuple[str, str]] = Field(default_factory=list)    # 강 구간(무순서 쌍): 도하 지연·수전 보정. [[DISCUSSION#9-9]]
+    generals: dict[str, General] = Field(default_factory=dict)          # 장수 로스터(무력·지력)
+    # --- 진행/결과 ---
+    next_op_id: int = 1                          # 작전 id 발급 카운터
+    winner: FactionName | None = None            # 승리 판정 결과(None=진행 중)
     history: list[str] = Field(default_factory=list)
 
 
