@@ -131,9 +131,9 @@ def apply_domestic(state: GameState, action: Domestic) -> None:
         city.troops += spend * DOMESTIC_GAIN
     elif action.item == "성벽보수":
         city.wall += max(1, spend // 3000)
-    elif action.item == "민심회복":
+    elif action.item == "사기진작":
         f = state.factions.get(city.owner)
-        if f:  # 민심은 하드 바운드 0~100 → 엔진에서 명시 클램프(모델 assign은 재검증 안 함)
+        if f:  # 사기는 하드 바운드 0~100 → 엔진에서 명시 클램프(모델 assign은 재검증 안 함)
             f.morale = max(0, min(100, f.morale + spend // 500))
     state.history.append(f"[내정] {city.owner} {action.city} {action.item}(금 {spend})")
 

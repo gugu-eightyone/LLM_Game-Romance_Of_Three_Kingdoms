@@ -155,8 +155,8 @@ def test_domestic_wall_and_overspend_clamp():
 def test_morale_hard_clamp_at_100():
     s = _mini_state()
     s.factions["촉"].morale = 98
-    apply_domestic(s, Domestic(kind="내정", city="성도", item="민심회복", gold_spent=5000))
-    assert s.factions["촉"].morale == 100               # 0~100 하드 바운드
+    apply_domestic(s, Domestic(kind="내정", city="성도", item="사기진작", gold_spent=5000))
+    assert s.factions["촉"].morale == 100               # 사기 0~100 하드 바운드
 
 
 def test_combat_round_wall_helps_defender():

@@ -5,7 +5,7 @@
 - LLM 출력(Action)은 discriminated union — 종류별 필드가 다르므로 flat+optional 대신 태그된 합집합.
 - 신뢰경계: LLM은 "의도"(Action)만 제안, "진행도"는 엔진 상태(ActiveOperation)가 소유.
 - 게임 로직 불변식(병사≥0, 금 보존 등)은 여기서 raise하지 않는다 — B층 평가가 "위반을 세야"
-  하므로, 자원은 순수 int로 두고 위반 탐지는 eval 쪽 검사 함수가 담당. (민심만 하드 클램프 0~100.)
+  하므로, 자원은 순수 int로 두고 위반 탐지는 eval 쪽 검사 함수가 담당. (사기만 하드 클램프 0~100.)
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ class City(BaseModel):
 class Faction(BaseModel):
     name: FactionName
     ruler: str                                   # 현 군주 장수 이름(포획 시 최고통솔 자동 승계로 갱신). [[DISCUSSION#9-16]]
-    morale: int = Field(default=50, ge=0, le=100)  # 민심: 하드 바운드(항상 클램프되는 값)
+    morale: int = Field(default=50, ge=0, le=100)  # 사기(士氣, 전투 의지 → 전투력 배수 예정). 하드 바운드. ※民心(백성 지지)은 별개 미래 스탯. [[DISCUSSION#9-10]]
     alive: bool = True                           # 세력 소멸(전 도시 상실) 시 False. 승리=천하통일 단일화
 
 
@@ -116,7 +116,7 @@ class Scheme(BaseModel):
 class Domestic(BaseModel):
     kind: Literal["내정"]
     city: str                                    # 자국 도시
-    item: Literal["식량증산", "모병", "민심회복", "성벽보수"]
+    item: Literal["식량증산", "모병", "사기진작", "성벽보수"]
     gold_spent: int = 0                           # 투입병력·대상적 없음
 
 
@@ -166,10 +166,10 @@ def demo() -> None:
     # 4) 자원 int는 음수도 "구성"은 된다 (B층이 위반을 세야 하므로 raise 안 함)
     assert City(name="합비", owner="위", troops=-5).troops == -5
 
-    # 5) 민심은 하드 바운드 → 초과는 거부
+    # 5) 사기는 하드 바운드 → 초과는 거부
     try:
         Faction(name="촉", ruler="유비", morale=150)
-        raise AssertionError("민심 150이 통과되면 안 됨")
+        raise AssertionError("사기 150이 통과되면 안 됨")
     except Exception as e:
         assert not isinstance(e, AssertionError), e
 
