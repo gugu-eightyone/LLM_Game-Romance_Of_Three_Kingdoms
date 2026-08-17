@@ -16,13 +16,17 @@ def _mini_state() -> GameState:
             "성도": City(name="성도", owner="촉", troops=10000, food=5000, gold=5000,
                           wall=1, generals=["조운"]),
             "한중": City(name="한중", owner="촉", troops=5000, food=3000, gold=2000, wall=1),
-            "업":   City(name="업", owner="위", troops=3000, food=2000, gold=4000, wall=0),
+            "업":   City(name="업", owner="위", troops=3000, food=2000, gold=4000, wall=0,
+                          generals=["조조"]),
         },
         factions={
-            "촉": Faction(name="촉", ruler="유비", capital="성도"),
-            "위": Faction(name="위", ruler="조조", capital="업"),
+            "촉": Faction(name="촉", ruler="유비"),
+            "위": Faction(name="위", ruler="조조"),
         },
-        generals={"조운": General(name="조운", command=91, might=95, intel=76)},
+        generals={
+            "조운": General(name="조운", command=91, might=95, intel=76),
+            "조조": General(name="조조", command=96, might=72, intel=91, is_ruler=True),
+        },
         distances={"성도": {"업": 1, "한중": 1}, "한중": {"성도": 1}, "업": {"성도": 1}},
     )
 
@@ -100,16 +104,37 @@ def test_repel_when_attacker_collapses():
     assert any("격퇴" in h for h in s.history)
 
 
-def test_decapitation_gate_and_victory():
+def test_last_city_captures_ruler_and_wins():
     s = _mini_state()
-    # 위의 마지막 거점(업) 함락 → 조조 포획·위 멸망 → 촉 승리
+    # 위 마지막 거점(업) 함락 → 탈출로 0(완전 포위) → 조조 포획·위 멸망 → 천하통일
     advance_turn(s, [Battle(kind="전투", mode="공성", origin="성도", target="업",
                             troops=10000, generals=["조운"])])
     advance_turn(s, [])
     assert s.factions["위"].alive is False
-    assert "조조" in s.factions["촉"].prisoners
+    assert "조조" in s.cities["업"].prisoners        # 포로=도시 수감(포획자=승자)
     check_victory(s)
-    assert s.winner == "촉"
+    assert s.winner == "촉"                          # 전 도시 촉 = 천하통일
+
+
+def test_defender_escapes_or_captured_not_vanish():
+    """탈출로(아군 인접 B) 열림 → 방어 장수는 증발 X: 포로(A) 또는 탈출(B). 포위도 0.5→포획 0.25."""
+    s = GameState(
+        cities={
+            "A": City(name="A", owner="위", troops=2000, wall=0, generals=["장료"]),
+            "B": City(name="B", owner="위", troops=3000, wall=0),               # 위 아군 = 탈출로
+            "C": City(name="C", owner="촉", troops=20000, generals=["조운"]),    # 공격 출발
+        },
+        factions={"위": Faction(name="위", ruler="장료"), "촉": Faction(name="촉", ruler="유비")},
+        generals={"장료": General(name="장료", command=95), "조운": General(name="조운", command=91)},
+        distances={"A": {"B": 1, "C": 1}, "B": {"A": 1}, "C": {"A": 1}},
+        seed=1,
+    )
+    advance_turn(s, [Battle(kind="전투", mode="공성", origin="C", target="A",
+                            troops=20000, generals=["조운"])])
+    advance_turn(s, [])
+    assert s.cities["A"].owner == "촉"
+    assert ("장료" in s.cities["A"].prisoners) or ("장료" in s.cities["B"].generals)  # 증발 아님
+    assert "장료" not in s.cities["A"].generals      # 접수 후 A 주둔 = 공격군만
 
 
 def test_domestic_recruit_deducts_gold():

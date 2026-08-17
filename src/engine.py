@@ -15,19 +15,12 @@ from pathlib import Path
 
 from .models import ActiveOperation, Battle, Domestic, GameState, Scheme
 
-# ======================= 캘리브레이션 손잡이 (플레이테스트로 튜닝) =======================
-FACTION_SPEED = {"오": 1.25}  # 진군 진행도/월(세력별). 미지정=DEFAULT_SPEED. 오=수전 기동(장강 고속). [[DISCUSSION#9-9]]
-DEFAULT_SPEED = 1.0          # 기본 진군 속도. 이동 threshold=거리(개월)라 1.0이면 거리만큼 걸려 도착.
-RIVER_CROSS_PENALTY = 1      # 강 구간 도하 지연(개월). 위·촉만 — 오(수전)는 면제.
-PREP_RATE = 0.2             # 조기도착 잉여(개월) → 첫 교전 우세도 보정 환산.
-PREP_CAP = 0.10             # prep 보정 상한(결정론 코어 지배 유지, STRATEGY_MODIFIER_BOUND 0.15보다 작게).
-FACTION_NAVAL = {"오": 2, "위": 1, "촉": 1}  # 증분2 야전 수전 보정용 예약. 증분1 이동엔 미사용.
-GENERAL_SCALE = 500         # 장수 보정 스케일: 병력배수 = 1 + 최고통솔/SCALE
-WALL_DEFENSE = 2500         # 성벽 레벨당 수비 병력환산 보너스(공격 우세 시 함락 가능하게 튜닝)
-ATTRITION_RATE = 0.10       # 교전 월 손실 계수(상대 전투력 대비)
-SIEGE_RATE = 3              # 교전 우세도(전력비-1) → 진행도/월
-SIEGE_BASE = 2              # 교전 threshold = SIEGE_BASE + 성벽레벨
-DOMESTIC_GAIN = 2           # 내정: 금 1 지출 → 식량/병력 2 (모병·식량증산)
+# 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
+from .config import (
+    ATTRITION_RATE, CAPTURE_FLOOR, DEFAULT_SPEED, DOMESTIC_GAIN, FACTION_SPEED,
+    GENERAL_SCALE, PREP_CAP, PREP_RATE, RIVER_CROSS_PENALTY, SIEGE_BASE,
+    SIEGE_RATE, WALL_DEFENSE,
+)
 
 SCENARIO_PATH = Path(__file__).resolve().parent.parent / "data" / "scenario.json"
 
@@ -183,26 +176,64 @@ def _advance_operation(state: GameState, op: ActiveOperation) -> None:
 
 
 def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
-    """함락: 소유 이전 + 약탈(자원은 그대로 승자 소유 = 보존, 복사 없음) + 참수 게이트."""
+    """함락: 소유 이전 + 약탈 + 방어 장수 탈출/포로 판정(포위도·seeded RNG) + 군주 자동 승계.
+
+    포위도 = 1 − (패자 소유 인접 도시 / 총 인접). 공격 출발지가 아군 아니라 항상 >0.
+    포획확률 = max(CAPTURE_FLOOR, 포위도²)(볼록: 제대로 에워싸야 급증). 완전 포위=탈출로0=확정.
+    방어 병사는 증발(승자 생존군이 주둔), 장수만 탈출/포로. 군주 포획=승계 트리거(멸망은 도시0). [[DISCUSSION#9-10]]·[[DISCUSSION#9-16]]
+    """
     loser, winner = city.owner, op.faction
+    defenders = list(city.generals)                 # 접수 전 방어 장수(군주 포함 가능)
+
+    neighbors = list(state.distances.get(city.name, {}))
+    total = len(neighbors) or 1
+    escape_dests = sorted(n for n in neighbors
+                          if n in state.cities and state.cities[n].owner == loser)
+    encircle = 1 - len(escape_dests) / total
+    capture_prob = max(CAPTURE_FLOOR, encircle ** 2)
+
+    # 도시 접수(금·식량=도시에 그대로=약탈, 병사=생존 공격군 주둔, 방어 병사 증발)
     city.owner = winner
-    city.troops = op.committed_troops          # 생존 공격군이 주둔
-    city.generals = list(op.committed_generals)  # 공격 장수가 접수 (식량·금은 도시에 그대로 = 약탈)
+    city.troops = op.committed_troops
+    city.generals = list(op.committed_generals)
     state.history.append(f"[작전{op.id}] {winner}, {city.name} 함락 (구 {loser})")
     if op in state.operations:
         state.operations.remove(op)
+
+    ruler_captured = False
+    for g in defenders:                              # 장수별 탈출/포로 (seeded RNG)
+        if escape_dests and state.rng.random() >= capture_prob:
+            state.cities[escape_dests[0]].generals.append(g)
+            state.history.append(f"  ↳ {g} {escape_dests[0]}(으)로 탈출")
+        else:
+            city.prisoners.append(g)
+            state.history.append(f"  ↳ {g} 포로 (포위도 {encircle:.2f})")
+            gen = state.generals.get(g)
+            if gen is not None and gen.is_ruler:
+                gen.is_ruler = False
+                ruler_captured = True
 
     lf = state.factions.get(loser)
     if lf is None or loser == "중립":
         return
     remaining = [n for n, c in state.cities.items() if c.owner == loser]
-    if not remaining:  # 마지막 거점 함락 → 군주 도주 불가 → 참수/포획 (하드 게이트 §9-4)
+    if not remaining:                                # 전 도시 상실 → 세력 소멸
         lf.alive = False
-        state.factions[winner].prisoners.append(lf.ruler)
-        state.history.append(f"⚔ {loser} 군주 {lf.ruler} 포획 — {loser} 멸망")
-    elif lf.capital == city.name:  # 수도만 함락, 잔여 거점 있음 → 천도
-        lf.capital = remaining[0]
-        state.history.append(f"{loser} 수도 함락 → {remaining[0]}(으)로 천도")
+        state.history.append(f"⚔ {loser} 멸망 (전 도시 상실)")
+    elif ruler_captured:                             # 군주 포획인데 도시 잔존 → 자동 승계
+        _succeed_ruler(state, loser)
+
+
+def _succeed_ruler(state: GameState, faction: str) -> None:
+    """군주 포획 시 최고 통솔 생존 장수 자동 승계(충성도·내분 X = 스코프 크립 회피). [[DISCUSSION#9-16]]"""
+    cand = [g for c in state.cities.values() if c.owner == faction for g in c.generals]
+    if not cand:                                     # 승계할 장수 없음(무두 잔존 → 다음 함락서 정리)
+        state.factions[faction].ruler = ""
+        return
+    heir = max(cand, key=lambda g: state.generals[g].command if g in state.generals else 0)
+    state.generals[heir].is_ruler = True
+    state.factions[faction].ruler = heir
+    state.history.append(f"  ↳ {faction} {heir} 군주 승계")
 
 
 # ======================= 요격 훅 (seam ②: 증분1 no-op) =======================
@@ -213,14 +244,10 @@ def check_interceptions(state: GameState) -> None:
 
 # ======================= 승리 판정 =======================
 def check_victory(state: GameState) -> None:
-    living = [n for n, f in state.factions.items() if f.alive]
-    if len(living) == 1:
-        state.winner = living[0]
-        state.history.append(f"★ {living[0]} 천하 제패 (참수 승리)")
-        return
+    """승리 = 천하통일(전 도시 단일 세력) 단일 조건. 참수 즉시승리 폐기(§9-16). 세력 소멸=도시0."""
     owners = {c.owner for c in state.cities.values()}
     non_neutral = owners - {"중립"}
-    if "중립" not in owners and len(non_neutral) == 1:  # 천하통일(전 도시 단일 세력)
+    if "중립" not in owners and len(non_neutral) == 1:
         state.winner = next(iter(non_neutral))
         state.history.append(f"★ {state.winner} 천하통일")
 

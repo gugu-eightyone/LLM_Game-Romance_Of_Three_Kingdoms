@@ -9,13 +9,12 @@
 """
 from __future__ import annotations
 
+import random
 from typing import Literal, Union
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter
 
-# --- 캘리브레이션 손잡이 (플레이테스트로 튜닝) ---
-STRATEGY_MAX_CHARS = 50          # 전략 자유서술 상한. 담화 아닌 지시라 짧게. [[DISCUSSION#9-8]]
-STRATEGY_MODIFIER_BOUND = 0.15   # judge 전략점수 → 전투 보정 상한(±). 결정론 코어가 지배하도록.
+from .config import STRATEGY_MAX_CHARS  # 캘리브레이션 상수는 config.py에 집약
 
 FactionName = Literal["위", "촉", "오", "중립"]
 
@@ -29,15 +28,14 @@ class City(BaseModel):
     gold: int = 0
     wall: int = 0            # 성벽 레벨: 공성 수비 보정(내정 성벽보수로 증가)
     generals: list[str] = Field(default_factory=list)  # 주둔 장수(로스터 이름 참조)
+    prisoners: list[str] = Field(default_factory=list)  # 이 도시에 수감된 포로(포획자=city.owner). 담화 co-location 기반. [[DISCUSSION#9-10]]
 
 
 class Faction(BaseModel):
     name: FactionName
-    ruler: str                                   # 군주 이름 = 참수(패배) 대상
-    capital: str = ""                            # 군주 위치 = 수도. 함락 시 이동/포획 판정 기준
+    ruler: str                                   # 현 군주 장수 이름(포획 시 최고통솔 자동 승계로 갱신). [[DISCUSSION#9-16]]
     morale: int = Field(default=50, ge=0, le=100)  # 민심: 하드 바운드(항상 클램프되는 값)
-    prisoners: list[str] = Field(default_factory=list)
-    alive: bool = True                           # 군주 참수 시 False → 세력 소멸
+    alive: bool = True                           # 세력 소멸(전 도시 상실) 시 False. 승리=천하통일 단일화
 
 
 class General(BaseModel):
@@ -46,6 +44,7 @@ class General(BaseModel):
     command: int = 50        # 통솔 = 군 전투 보정 (_power가 읽는 유일 스탯)
     might: int = 50          # 무력 = 일기토(개인 무예). 일기토 시스템 붙을 때까지 휴면
     intel: int = 50          # 지력 = 계략·정보(안개). 증분2 배선
+    is_ruler: bool = False   # 군주 플래그. 포획 시 세력 자동 승계 트리거(멸망은 도시0일 때만). [[DISCUSSION#9-16]]
 
 
 class ActiveOperation(BaseModel):
@@ -67,17 +66,31 @@ class ActiveOperation(BaseModel):
 class GameState(BaseModel):
     year: int = 0
     month: int = 1
+    seed: int = 0                                # 확률 판정(포로화 등) 재현용 씨앗. 엔진 소유 RNG. D층 100판 배치 재현성. [[DISCUSSION#9-10]]
     cities: dict[str, City] = Field(default_factory=dict)
     factions: dict[str, Faction] = Field(default_factory=dict)
     operations: list[ActiveOperation] = Field(default_factory=list)
     # --- 정적 세계 데이터(게임 중 불변). 시나리오에서 로드, State에 함께 실어 다님 ---
     distances: dict[str, dict[str, int]] = Field(default_factory=dict)  # 인접·거리(개월): city→neighbor→months
     river_edges: list[tuple[str, str]] = Field(default_factory=list)    # 강 구간(무순서 쌍): 도하 지연·수전 보정. [[DISCUSSION#9-9]]
-    generals: dict[str, General] = Field(default_factory=dict)          # 장수+군주 로스터(통솔·무력·지력). 군주도 여기 등재(스탯 보유), 위치=Faction.capital
+    generals: dict[str, General] = Field(default_factory=dict)          # 장수+군주 로스터(통솔·무력·지력·is_ruler). 위치=주둔 도시의 generals 리스트
     # --- 진행/결과 ---
     next_op_id: int = 1                          # 작전 id 발급 카운터
     winner: FactionName | None = None            # 승리 판정 결과(None=진행 중)
     history: list[str] = Field(default_factory=list)
+
+    _rng: random.Random | None = PrivateAttr(default=None)  # 엔진 소유 시드 RNG(직렬화 제외)
+
+    def model_post_init(self, __context: object) -> None:
+        if self._rng is None:
+            self._rng = random.Random(self.seed)
+
+    @property
+    def rng(self) -> random.Random:
+        """포로화 등 확률 판정용 시드 고정 RNG(엔진 전용, LLM 관여 0)."""
+        if self._rng is None:
+            self._rng = random.Random(self.seed)
+        return self._rng
 
 
 # ======================= LLM 의도(Action) — discriminated union =======================

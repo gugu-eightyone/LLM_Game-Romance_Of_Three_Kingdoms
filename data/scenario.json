@@ -1,12 +1,12 @@
 {
   "_comment": "삼국정립 지도 v2 (~219, 형주 삼분). 손 큐레이트 초기값 — 전부 튜닝 손잡이. 설계: DISCUSSION §9-9. 위8·촉4·오4=총16. 합비 폐기→하비(위 동북 종심). 여강=오 4번째. 강릉=촉(관우). 양양=위. 위-오 전선 2축: 수춘-여강(회남)·하비-건업(광릉). river_edges=강 구간(도하 지연·수전 보정).",
   "factions": {
-    "위": {"name": "위", "ruler": "조조", "capital": "업", "morale": 60},
-    "촉": {"name": "촉", "ruler": "유비", "capital": "성도", "morale": 55},
-    "오": {"name": "오", "ruler": "손권", "capital": "건업", "morale": 55}
+    "위": {"name": "위", "ruler": "조조", "morale": 60},
+    "촉": {"name": "촉", "ruler": "유비", "morale": 55},
+    "오": {"name": "오", "ruler": "손권", "morale": 55}
   },
   "cities": {
-    "업":   {"name": "업",   "owner": "위", "troops": 30000, "food": 32000, "gold": 12000, "wall": 3, "generals": ["허저", "사마의"]},
+    "업":   {"name": "업",   "owner": "위", "troops": 30000, "food": 32000, "gold": 12000, "wall": 3, "generals": ["조조", "허저", "사마의"]},
     "허창": {"name": "허창", "owner": "위", "troops": 25000, "food": 26000, "gold": 9000,  "wall": 2, "generals": ["순욱"]},
     "낙양": {"name": "낙양", "owner": "위", "troops": 25000, "food": 24000, "gold": 10000, "wall": 2, "generals": ["하후돈"]},
     "장안": {"name": "장안", "owner": "위", "troops": 20000, "food": 20000, "gold": 7000,  "wall": 2, "generals": ["하후연", "장합"]},
@@ -15,12 +15,12 @@
     "양양": {"name": "양양", "owner": "위", "troops": 22000, "food": 22000, "gold": 8000,  "wall": 2, "generals": ["조인"]},
     "하비": {"name": "하비", "owner": "위", "troops": 20000, "food": 20000, "gold": 7000,  "wall": 2, "generals": ["장패", "우금"]},
 
-    "성도": {"name": "성도", "owner": "촉", "troops": 30000, "food": 30000, "gold": 11000, "wall": 3, "generals": ["조운", "제갈량"]},
+    "성도": {"name": "성도", "owner": "촉", "troops": 30000, "food": 30000, "gold": 11000, "wall": 3, "generals": ["유비", "조운", "제갈량"]},
     "한중": {"name": "한중", "owner": "촉", "troops": 22000, "food": 22000, "gold": 7000,  "wall": 2, "generals": ["마초", "장비"]},
     "강주": {"name": "강주", "owner": "촉", "troops": 18000, "food": 18000, "gold": 6000,  "wall": 1, "generals": ["황충"]},
     "강릉": {"name": "강릉", "owner": "촉", "troops": 22000, "food": 22000, "gold": 8000,  "wall": 2, "generals": ["관우"]},
 
-    "건업": {"name": "건업", "owner": "오", "troops": 28000, "food": 28000, "gold": 11000, "wall": 3, "generals": ["육손", "태사자"]},
+    "건업": {"name": "건업", "owner": "오", "troops": 28000, "food": 28000, "gold": 11000, "wall": 3, "generals": ["손권", "육손", "태사자"]},
     "시상": {"name": "시상", "owner": "오", "troops": 22000, "food": 22000, "gold": 7000,  "wall": 2, "generals": ["주유", "감녕"]},
     "강하": {"name": "강하", "owner": "오", "troops": 20000, "food": 20000, "gold": 6000,  "wall": 2, "generals": ["여몽"]},
     "여강": {"name": "여강", "owner": "오", "troops": 20000, "food": 20000, "gold": 7000,  "wall": 2, "generals": ["주태"]}
@@ -53,9 +53,9 @@
     "태사자": {"name": "태사자", "command": 80, "might": 90, "intel": 58},
     "주태":   {"name": "주태",   "command": 78, "might": 88, "intel": 55},
 
-    "조조":   {"name": "조조",   "command": 96, "might": 72, "intel": 91},
-    "유비":   {"name": "유비",   "command": 84, "might": 73, "intel": 78},
-    "손권":   {"name": "손권",   "command": 78, "might": 70, "intel": 79}
+    "조조":   {"name": "조조",   "command": 96, "might": 72, "intel": 91, "is_ruler": true},
+    "유비":   {"name": "유비",   "command": 84, "might": 73, "intel": 78, "is_ruler": true},
+    "손권":   {"name": "손권",   "command": 78, "might": 70, "intel": 79, "is_ruler": true}
   },
   "distances": {
     "업":   {"허창": 1},
