@@ -41,10 +41,11 @@ class Faction(BaseModel):
 
 
 class General(BaseModel):
-    """장수 로스터(정적). 린하게 2숫자만 — 무력=전투보정, 지력=계략보정. [[DISCUSSION#9-9]]"""
+    """장수 로스터(정적). 3스탯 — 통솔=군 전투(_power), 무력=일기토(예약·휴면), 지력=계략·정보. [[DISCUSSION#9-15]]"""
     name: str
-    might: int = 50          # 무력
-    intel: int = 50          # 지력
+    command: int = 50        # 통솔 = 군 전투 보정 (_power가 읽는 유일 스탯)
+    might: int = 50          # 무력 = 일기토(개인 무예). 일기토 시스템 붙을 때까지 휴면
+    intel: int = 50          # 지력 = 계략·정보(안개). 증분2 배선
 
 
 class ActiveOperation(BaseModel):
@@ -72,7 +73,7 @@ class GameState(BaseModel):
     # --- 정적 세계 데이터(게임 중 불변). 시나리오에서 로드, State에 함께 실어 다님 ---
     distances: dict[str, dict[str, int]] = Field(default_factory=dict)  # 인접·거리(개월): city→neighbor→months
     river_edges: list[tuple[str, str]] = Field(default_factory=list)    # 강 구간(무순서 쌍): 도하 지연·수전 보정. [[DISCUSSION#9-9]]
-    generals: dict[str, General] = Field(default_factory=dict)          # 장수 로스터(무력·지력)
+    generals: dict[str, General] = Field(default_factory=dict)          # 장수+군주 로스터(통솔·무력·지력). 군주도 여기 등재(스탯 보유), 위치=Faction.capital
     # --- 진행/결과 ---
     next_op_id: int = 1                          # 작전 id 발급 카운터
     winner: FactionName | None = None            # 승리 판정 결과(None=진행 중)

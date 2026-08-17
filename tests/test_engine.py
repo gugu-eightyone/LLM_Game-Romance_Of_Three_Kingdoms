@@ -22,7 +22,7 @@ def _mini_state() -> GameState:
             "촉": Faction(name="촉", ruler="유비", capital="성도"),
             "위": Faction(name="위", ruler="조조", capital="업"),
         },
-        generals={"조운": General(name="조운", might=95, intel=76)},
+        generals={"조운": General(name="조운", command=91, might=95, intel=76)},
         distances={"성도": {"업": 1, "한중": 1}, "한중": {"성도": 1}, "업": {"성도": 1}},
     )
 
@@ -31,10 +31,20 @@ def test_power_monotonic():
     s = _mini_state()
     # 병력 많을수록 강함
     assert _power(20000, [], s) > _power(10000, [], s)
-    # 장수(무력 95)가 붙으면 보정으로 더 강함
+    # 장수(통솔 91)가 붙으면 보정으로 더 강함
     assert _power(10000, ["조운"], s) > _power(10000, [], s)
     # 로스터에 없는 이름은 보정 0(환각 무시)
     assert _power(10000, ["없는장수"], s) == _power(10000, [], s)
+
+
+def test_power_uses_top_commander():
+    """지휘관(최고 통솔) 1명만 반영 — 장수 수 스택 무보상(부장 시스템 없음)."""
+    s = _mini_state()
+    s.generals["장비"] = General(name="장비", command=82)   # 조운 command 91
+    # 조운(91)+장비(82) = 조운 단독과 동일(최고통솔만 반영)
+    assert _power(10000, ["조운", "장비"], s) == _power(10000, ["조운"], s)
+    # 통솔 낮은 장수 단독은 더 약함
+    assert _power(10000, ["장비"], s) < _power(10000, ["조운"], s)
 
 
 def test_start_operation_clamps_overcommit():

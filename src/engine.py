@@ -22,7 +22,7 @@ RIVER_CROSS_PENALTY = 1      # 강 구간 도하 지연(개월). 위·촉만 —
 PREP_RATE = 0.2             # 조기도착 잉여(개월) → 첫 교전 우세도 보정 환산.
 PREP_CAP = 0.10             # prep 보정 상한(결정론 코어 지배 유지, STRATEGY_MODIFIER_BOUND 0.15보다 작게).
 FACTION_NAVAL = {"오": 2, "위": 1, "촉": 1}  # 증분2 야전 수전 보정용 예약. 증분1 이동엔 미사용.
-GENERAL_SCALE = 500         # 장수 보정 스케일: 병력배수 = 1 + sum(무력)/SCALE
+GENERAL_SCALE = 500         # 장수 보정 스케일: 병력배수 = 1 + 최고통솔/SCALE
 WALL_DEFENSE = 2500         # 성벽 레벨당 수비 병력환산 보너스(공격 우세 시 함락 가능하게 튜닝)
 ATTRITION_RATE = 0.10       # 교전 월 손실 계수(상대 전투력 대비)
 SIEGE_RATE = 3              # 교전 우세도(전력비-1) → 진행도/월
@@ -49,8 +49,13 @@ def _is_river(state: GameState, a: str, b: str) -> bool:
 
 # ======================= 전투 (seam ①: 군대 vs 군대 일반화) =======================
 def _power(troops: int, generals: list[str], state: GameState) -> float:
-    """부대 전투력 = 병력 × (1 + 장수 무력합/스케일). 공성·야전 공통."""
-    bonus = sum(state.generals[g].might for g in generals if g in state.generals)
+    """부대 전투력 = 병력 × (1 + 최고통솔/스케일). 공성·야전 공통.
+
+    지휘관(최고 통솔) 1명만 반영 — 장수 수 스택은 무보상(부장 시스템 없음, 위 깊이 우위 억제).
+    군 전투는 통솔만 읽음(무력=일기토·지력=계략은 각자 서브시스템). [[DISCUSSION#9-15]]·[[DISCUSSION#9-16]]
+    """
+    cmds = [state.generals[g].command for g in generals if g in state.generals]
+    bonus = max(cmds) if cmds else 0
     return troops * (1 + bonus / GENERAL_SCALE)
 
 
