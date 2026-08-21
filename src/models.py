@@ -61,6 +61,8 @@ class ActiveOperation(BaseModel):
     prep: float = 0                              # 조기도착 잉여(개월). 오만 >0 → 첫 교전 준비보정(토루). [[DISCUSSION#9-9]]
     committed_troops: int = 0                     # 검증·클램프된 실제 투입
     committed_generals: list[str] = Field(default_factory=list)  # 검증된 동행 장수
+    unit_morale: int = 50                         # 부대 사기: 출전 시 전역 사기 복사→독립. 전투력 배수·매교전 소량 감소. [[DISCUSSION#9-10]]
+    has_fought: bool = False                      # 야전 교전 1회+ 경험. True인 야전 op는 상대 소멸 시 출격 종료→복귀(공성은 임무 재개). [[DISCUSSION#9-10]]
 
 
 class GameState(BaseModel):

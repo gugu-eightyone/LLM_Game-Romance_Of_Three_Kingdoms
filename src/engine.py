@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 from .models import ActiveOperation, Battle, Domestic, GameState, Scheme
 
 # 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
 from .config import (
     ATTRITION_RATE, CAPTURE_FLOOR, DEFAULT_SPEED, DOMESTIC_GAIN, FACTION_SPEED,
-    GENERAL_SCALE, PREP_CAP, PREP_RATE, RIVER_CROSS_PENALTY, SIEGE_BASE,
-    SIEGE_RATE, WALL_DEFENSE,
+    FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE, MORALE_COMBAT_BAND,
+    PREP_CAP, PREP_RATE, RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE,
+    SIEGE_RATE, UNIT_MORALE_COMBAT_DROP, WALL_DEFENSE,
 )
 
 SCENARIO_PATH = Path(__file__).resolve().parent.parent / "data" / "scenario.json"
@@ -41,32 +43,39 @@ def _is_river(state: GameState, a: str, b: str) -> bool:
 
 
 # ======================= 전투 (seam ①: 군대 vs 군대 일반화) =======================
-def _power(troops: int, generals: list[str], state: GameState) -> float:
-    """부대 전투력 = 병력 × (1 + 최고통솔/스케일). 공성·야전 공통.
+def _power(state: GameState, troops: int, generals: list[str], morale: int = 50) -> float:
+    """부대 전투력 = 병력 × (1 + 최고통솔/스케일) × 사기배수. 공성·야전 공통.
 
     지휘관(최고 통솔) 1명만 반영 — 장수 수 스택은 무보상(부장 시스템 없음, 위 깊이 우위 억제).
     군 전투는 통솔만 읽음(무력=일기토·지력=계략은 각자 서브시스템). [[DISCUSSION#9-15]]·[[DISCUSSION#9-16]]
+    사기배수 = 1+(morale−50)/50×BAND (m50=1.0 → 기본상태 무영향). [[DISCUSSION#9-10]]
     """
     cmds = [state.generals[g].command for g in generals if g in state.generals]
     bonus = max(cmds) if cmds else 0
-    return troops * (1 + bonus / GENERAL_SCALE)
+    morale_factor = 1 + (morale - 50) / 50 * MORALE_COMBAT_BAND
+    return troops * (1 + bonus / GENERAL_SCALE) * morale_factor
 
 
-def _combat_round(
-    atk_troops: int, atk_generals: list[str],
-    def_troops: int, def_generals: list[str],
-    state: GameState, wall: int = 0,
-) -> tuple[int, int, float]:
-    """한 달치 교전 결과: (공격 손실, 방어 손실, 우세도). 공성·야전 재사용(§9-9 seam①).
+class Force(NamedTuple):
+    """전투 한 진영의 입력(대칭). 성=wall 보유·야전=wall 0. morale=전투력 배수. 나중 judge 넛지도 여기 필드 추가."""
+    troops: int
+    generals: list[str]
+    wall: int = 0
+    morale: int = 50
 
-    wall은 방어측 성벽 보너스(야전은 0). 우세도>0이면 공격이 유리해 공성 진행도 누적.
+
+def _combat_round(state: GameState, a: Force, b: Force) -> tuple[int, int, float]:
+    """한 달치 교전 결과: (a 손실, b 손실, a우세도). 공성·야전 공통(§9-9 seam①).
+
+    완전 대칭 — 역할(공/수)은 호출자가 우세도 부호로 해석(공성: a=공격, 우세도>0이면 진행도 누적).
+    wall은 그 진영 축성 보너스(야전=0). morale=전투력 배수(미지정 50=중립 → 기존 무변).
     """
-    atk = _power(atk_troops, atk_generals, state)
-    dfn = _power(def_troops, def_generals, state) + wall * WALL_DEFENSE
-    atk_loss = min(atk_troops, round(dfn * ATTRITION_RATE))
-    def_loss = min(def_troops, round(atk * ATTRITION_RATE))
-    dominance = (atk / dfn - 1) if dfn > 0 else 999.0
-    return atk_loss, def_loss, dominance
+    ap = _power(state, a.troops, a.generals, a.morale) + a.wall * WALL_DEFENSE
+    bp = _power(state, b.troops, b.generals, b.morale) + b.wall * WALL_DEFENSE
+    a_loss = min(a.troops, round(bp * ATTRITION_RATE))
+    b_loss = min(b.troops, round(ap * ATTRITION_RATE))
+    dominance = (ap / bp - 1) if bp > 0 else 999.0
+    return a_loss, b_loss, dominance
 
 
 # ======================= 작전 개시 (검증=평가표면) =======================
@@ -104,10 +113,12 @@ def start_operation(state: GameState, action: Battle) -> ActiveOperation | None:
     river = _is_river(state, action.origin, action.target)
     if river and faction != "오":          # 위·촉 도하 지연(오는 수전이라 면제)
         dist += RIVER_CROSS_PENALTY
+    fac = state.factions.get(faction)
     op = ActiveOperation(
         id=state.next_op_id, faction=faction, action=action,
         stage="이동", progress=0, threshold=dist,
         committed_troops=committed, committed_generals=valid,
+        unit_morale=fac.morale if fac else 50,       # 출전 시 전역 사기 복사→독립
     )
     state.next_op_id += 1
     state.operations.append(op)
@@ -138,41 +149,70 @@ def apply_domestic(state: GameState, action: Domestic) -> None:
     state.history.append(f"[내정] {city.owner} {action.city} {action.item}(금 {spend})")
 
 
-# ======================= 작전 진행 (이동 → 교전 → 해소) =======================
-def _advance_operation(state: GameState, op: ActiveOperation) -> None:
+# ======================= 이동 (마일스톤=암묵적, progress로 파생) =======================
+def _advance_movement(state: GameState) -> None:
+    """이동중 작전 진행. 필드 교전 중(고정)이거나 야전 교전 마친(has_fought) op는 안 움직임.
+
+    마일스톤은 노드로 만들지 않음 — 위치=`(origin,target,progress)`. 충돌은 `_resolve_combat`이 술어로 판정.
+    """
+    engaged = _field_engaged_ids(state)
+    for op in list(state.operations):
+        if op.stage != "이동" or op.id in engaged:
+            continue
+        if op.action.mode == "야전" and op.has_fought:   # 교전 마친 야전=복귀 대기(전진 안 함)
+            continue
+        op.progress += FACTION_SPEED.get(op.faction, DEFAULT_SPEED)
+        if op.progress >= op.threshold:
+            _arrive(state, op)
+
+
+def _arrive(state: GameState, op: ActiveOperation) -> None:
+    """작전이 목표 도시 도착. 공성=교전 개시(수비대). 야전=적 공성 op 있으면 교전, 없으면 출격 종료."""
     city = state.cities.get(op.action.target)
     if city is None:
         state.history.append(f"[작전{op.id}] 대상 도시 소멸 → 취소")
         state.operations.remove(op)
         return
+    if op.action.mode == "공성":
+        op.prep = op.progress - op.threshold          # 조기도착 잉여(오만 >0) → 교전 선취(토루)
+        op.stage = "교전"
+        op.progress = 0
+        op.threshold = SIEGE_BASE + city.wall
+        prep_note = f", 준비 {op.prep:.2f}" if op.prep > 0 else ""
+        state.history.append(f"[작전{op.id}] {op.faction} 부대 {city.name} 도착 → 공성 개시{prep_note}")
+    else:                                             # 야전: 그 도시 공성중인 적 있으면 구원 교전
+        besiegers = [o for o in state.operations
+                     if o.faction != op.faction and o.stage == "교전" and o.action.target == op.action.target]
+        if besiegers:
+            op.stage = "교전"                         # 도시서 야전 교전(수비대 안 침, 적 op만)
+            state.history.append(f"[작전{op.id}] {op.faction} 구원군 {city.name} 도착 → 야전 교전")
+        else:
+            _return_home(state, op, "출격 종료(대상 없음)")
 
-    if op.stage == "이동":
-        op.progress += FACTION_SPEED.get(op.faction, DEFAULT_SPEED)
-        if op.progress >= op.threshold:
-            op.prep = op.progress - op.threshold   # 조기도착 잉여(오만 >0) → 교전 선취(토루)
-            op.stage = "교전"
-            op.progress = 0
-            op.threshold = SIEGE_BASE + city.wall
-            prep_note = f", 준비 {op.prep:.2f}" if op.prep > 0 else ""
-            state.history.append(f"[작전{op.id}] {op.faction} 부대 {city.name} 도착 → 교전 개시{prep_note}")
+
+def _siege_round(state: GameState, op: ActiveOperation) -> None:
+    """공성 교전 1라운드: 군대 vs 성 수비대(seam① 재사용, wall 보너스). 돌파 시 함락.
+
+    공격=부대 사기(op.unit_morale), 수비=전역 사기(수성=작전 아님 → 세력값). 전멸/퇴각은 `_resolve_op_end`.
+    """
+    city = state.cities.get(op.action.target)
+    if city is None:
+        state.operations.remove(op)
         return
-
-    # 교전: 군대 vs 성 수비대 (seam① 함수 재사용, wall 보너스)
+    dfac = state.factions.get(city.owner)
     atk_loss, def_loss, dominance = _combat_round(
-        op.committed_troops, op.committed_generals,
-        city.troops, city.generals, state, wall=city.wall)
-    if op.prep > 0:                                # 조기도착 준비이점: 캡 씌운 결정론 1회 보정
+        state,
+        Force(op.committed_troops, op.committed_generals, morale=op.unit_morale),
+        Force(city.troops, city.generals, wall=city.wall, morale=dfac.morale if dfac else 50))
+    if op.prep > 0:                                   # 조기도착 준비이점: 캡 씌운 결정론 1회 보정
         dominance += min(PREP_CAP, op.prep * PREP_RATE)
         op.prep = 0
     op.committed_troops -= atk_loss
+    op.unit_morale = max(0, op.unit_morale - UNIT_MORALE_COMBAT_DROP)
     city.troops -= def_loss
     op.progress += max(0, round(dominance * SIEGE_RATE))
-
-    if city.troops <= 0 or op.progress >= op.threshold:
+    if op.committed_troops > 0 and (city.troops <= 0 or op.progress >= op.threshold):
         _capture_city(state, op, city)
-    elif op.committed_troops <= 0:
-        state.history.append(f"[작전{op.id}] {op.faction} 공격 붕괴 → 격퇴")
-        state.operations.remove(op)
 
 
 def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
@@ -236,10 +276,167 @@ def _succeed_ruler(state: GameState, faction: str) -> None:
     state.history.append(f"  ↳ {faction} {heir} 군주 승계")
 
 
-# ======================= 요격 훅 (seam ②: 증분1 no-op) =======================
-def check_interceptions(state: GameState) -> None:
-    """증분 2에서 이동중 작전 요격(야전) 로직을 여기 채운다. 증분1은 아무것도 안 함."""
-    return
+# ======================= 야전 (지속 전투: 요격·구원군, 마일스톤=암묵) =======================
+def _field_engagements(state: GameState) -> list[tuple[ActiveOperation, ActiveOperation]]:
+    """현재 위치에서 교전 중인 대립 작전 쌍(야전). 위치=술어(저장 안 함, Option A).
+
+    ① 같은 간선 반대방향 이동 + progress합 ≥ 거리 → 도로에서 교차(마일스톤 지점).
+    ② 같은 도시서 둘 다 교전(공성 op ↔ 그 도시 도착한 구원 op).
+    """
+    ops = list(state.operations)
+    pairs = []
+    for i, a in enumerate(ops):
+        for b in ops[i + 1:]:
+            if a.faction == b.faction:
+                continue
+            if (a.stage == "이동" and b.stage == "이동"
+                    and a.action.origin == b.action.target and a.action.target == b.action.origin):
+                d = state.distances.get(a.action.origin, {}).get(a.action.target)
+                if d and (a.progress + b.progress) >= d:
+                    pairs.append((a, b))
+                    continue
+            if a.stage == "교전" and b.stage == "교전" and a.action.target == b.action.target:
+                pairs.append((a, b))
+    return pairs
+
+
+def _field_engaged_ids(state: GameState) -> set[int]:
+    return {op.id for pair in _field_engagements(state) for op in pair}
+
+
+def _field_round(state: GameState, a: ActiveOperation, b: ActiveOperation) -> None:
+    """야전 1라운드(부대 vs 부대, wall=0, 순수 대칭). 협공은 '두 번 맞음'으로 자연 발생(보너스 없음)."""
+    a_loss, b_loss, _ = _combat_round(
+        state,
+        Force(a.committed_troops, a.committed_generals, morale=a.unit_morale),
+        Force(b.committed_troops, b.committed_generals, morale=b.unit_morale))
+    a.committed_troops -= a_loss
+    b.committed_troops -= b_loss
+    a.unit_morale = max(0, a.unit_morale - UNIT_MORALE_COMBAT_DROP)
+    b.unit_morale = max(0, b.unit_morale - UNIT_MORALE_COMBAT_DROP)
+    a.has_fought = b.has_fought = True
+    state.history.append(
+        f"[야전] 작전{a.id}({a.faction}) ↔ 작전{b.id}({b.faction}): -{a_loss}/-{b_loss}")
+
+
+def _resolve_combat(state: GameState) -> None:
+    """한 턴 전투 해소: 야전(필드 쌍) → 공성(수비대) → 종료(전멸/퇴각/포로) → 야전 승자 복귀."""
+    pairs = _field_engagements(state)
+    n_opp: dict[int, int] = {}
+    for a, b in pairs:
+        _field_round(state, a, b)
+        n_opp[a.id] = n_opp.get(a.id, 0) + 1
+        n_opp[b.id] = n_opp.get(b.id, 0) + 1
+    for op in list(state.operations):                # 공성 라운드(필드 피해 반영된 병력으로 → 협공 자연 발생)
+        if op.action.mode == "공성" and op.stage == "교전":
+            _siege_round(state, op)
+    for op in list(state.operations):                # 종료 판정
+        _resolve_op_end(state, op, n_opp.get(op.id, 0))
+    engaged = {op.id for pair in pairs for op in pair}
+    for op in list(state.operations):                # 야전 승자(교전 마치고 상대 소멸) → 자동 복귀(서브초이스2)
+        if (op.action.mode == "야전" and op.has_fought
+                and op.id not in engaged and op.committed_troops > 0):
+            _return_home(state, op, "요격 완료")
+
+
+def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int) -> None:
+    """전멸(야전 피해→포로 / 공성 붕괴→격퇴) + 확률적 강제 퇴각(사기 붕괴)."""
+    if op not in state.operations:                   # 이미 함락 등으로 해소
+        return
+    if op.committed_troops <= 0:
+        if n_field > 0:
+            _destroy_field_op(state, op, n_field)    # 야전 전멸 → 장수 포획(base×부대수)
+        else:
+            _return_home(state, op, "격퇴" if op.action.mode == "공성" else "무위", troops=False)
+        return
+    fighting = op.stage == "교전" or n_field > 0
+    if fighting and op.unit_morale < ROUT_MORALE_THRESHOLD:
+        deficit = ROUT_MORALE_THRESHOLD - op.unit_morale
+        if state.rng.random() < (deficit / ROUT_MORALE_THRESHOLD) ** 2:
+            _retreat_op(state, op)
+
+
+# ---- 작전 해소 처분(복귀/격퇴/퇴각/야전포로) ----
+def _home_city(state: GameState, op: ActiveOperation) -> str | None:
+    """복귀·퇴각 목적지: 출발도시(아군이면) → 현 위치 인접 아군 도시 → 없으면 None(고립)."""
+    o = state.cities.get(op.action.origin)
+    if o and o.owner == op.faction:
+        return op.action.origin
+    for node in (op.action.target, op.action.origin):
+        for nb in state.distances.get(node, {}):
+            c = state.cities.get(nb)
+            if c and c.owner == op.faction:
+                return nb
+    return None
+
+
+def _nearest_enemy_city(state: GameState, op: ActiveOperation) -> str | None:
+    """야전 포로 호송지: 현 위치 인접 적(비중립) 도시."""
+    for node in (op.action.target, op.action.origin):
+        c = state.cities.get(node)
+        if c and c.owner not in (op.faction, "중립"):
+            return node
+        for nb in state.distances.get(node, {}):
+            c2 = state.cities.get(nb)
+            if c2 and c2.owner not in (op.faction, "중립"):
+                return nb
+    return None
+
+
+def _return_home(state: GameState, op: ActiveOperation, reason: str, troops: bool = True) -> None:
+    """출격/작전 종료 → 생존군·장수 아군 도시 복귀. 고립(복귀지 없음)이면 장수 소실."""
+    dest = _home_city(state, op)
+    if dest:
+        if troops:
+            state.cities[dest].troops += max(0, op.committed_troops)
+        state.cities[dest].generals.extend(op.committed_generals)
+    state.history.append(f"[작전{op.id}] {op.faction} {reason} → {dest or '복귀 실패(고립)'}")
+    if op in state.operations:
+        state.operations.remove(op)
+
+
+def _retreat_op(state: GameState, op: ActiveOperation) -> None:
+    """확률적 강제 퇴각: 추가 손실 후 아군 도시로 즉시 귀환(간선서 제거=재충돌 방지).
+
+    복귀지 없으면(적진 고립) 퇴각 불가 → 계속 싸움 → 다음 전멸 시 야전 포로(포위의 대가).
+    """
+    dest = _home_city(state, op)
+    if dest is None:
+        return
+    op.committed_troops -= round(op.committed_troops * FIELD_RETREAT_LOSS)
+    state.cities[dest].troops += max(0, op.committed_troops)
+    state.cities[dest].generals.extend(op.committed_generals)
+    state.history.append(f"[퇴각] {op.faction} 작전{op.id} 사기 붕괴(사기 {op.unit_morale}) → {dest}")
+    state.operations.remove(op)
+
+
+def _take_prisoner(state: GameState, holding_city: str, g: str) -> bool:
+    """장수 g를 holding_city 수감. 군주면 is_ruler 해제 + True 반환(승계 트리거)."""
+    state.cities[holding_city].prisoners.append(g)
+    gen = state.generals.get(g)
+    if gen is not None and gen.is_ruler:
+        gen.is_ruler = False
+        return True
+    return False
+
+
+def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int) -> None:
+    """야전 전멸: 장수 포획확률 = base × 교전 적 부대 수. 포획=최근접 적 도시 호송(탈영 없음), 실패=아군 복귀."""
+    prob = min(1.0, FIELD_CAPTURE_BASE * n_field)
+    jail = _nearest_enemy_city(state, op)
+    home = _home_city(state, op)
+    ruler_lost = False
+    for g in list(op.committed_generals):
+        if jail and state.rng.random() < prob:
+            if _take_prisoner(state, jail, g):
+                ruler_lost = True
+            state.history.append(f"  ↳ {g} 야전 포로 → {jail}")
+        elif home:
+            state.cities[home].generals.append(g)     # 포획 실패 → 아군 복귀
+    state.history.append(f"[야전 전멸] {op.faction} 작전{op.id} 궤멸")
+    state.operations.remove(op)
+    if ruler_lost and state.factions.get(op.faction) and state.factions[op.faction].alive:
+        _succeed_ruler(state, op.faction)
 
 
 # ======================= 승리 판정 =======================
@@ -257,21 +454,17 @@ def _dispatch(state: GameState, action) -> None:
     if isinstance(action, Domestic):
         apply_domestic(state, action)
     elif isinstance(action, Battle):
-        if action.mode == "공성":
-            start_operation(state, action)
-        else:
-            state.history.append(f"[증분2] 야전 미구현 → 무시 ({action.origin}→{action.target})")
+        start_operation(state, action)               # 공성·야전 모두 진군 작전으로 개시
     elif isinstance(action, Scheme):
         state.history.append(f"[증분2] 계략({action.scheme_type}) 미구현 → 무시")
 
 
 def advance_turn(state: GameState, actions: list) -> None:
-    """한 달 진행: 의도 반영(개시/내정) → 요격훅 → 작전 진행 → 승리판정 → 시간."""
+    """한 달 진행: 개시/내정 → 이동(마일스톤) → 전투 해소(야전·공성·퇴각·포로) → 승리 → 시간."""
     for a in actions:
         _dispatch(state, a)
-    check_interceptions(state)                       # seam② 빈 훅
-    for op in list(state.operations):                # 복사본 순회(해소 시 remove 안전)
-        _advance_operation(state, op)
+    _advance_movement(state)                          # 이동중 작전 진행(필드 교전=고정)
+    _resolve_combat(state)                            # 야전 쌍 → 공성 → 종료 판정
     check_victory(state)
     state.month += 1
     if state.month > 12:
@@ -293,6 +486,22 @@ def demo() -> None:
         advance_turn(state, [])
     print("\n".join(state.history[-12:]))
     print(f"\n하비 소유: {state.cities['하비'].owner} / 승자: {state.winner}")
+
+    # 도로 요격 데모: 위 장안→한중 공성 진군(거리2)을, 촉 한중→장안 야전 출격으로 길목 요격.
+    print("\n--- 도로 요격 데모 (장안↔한중 거리2) ---")
+    s2 = load_scenario()
+    h0 = len(s2.history)
+    advance_turn(s2, [
+        Battle(kind="전투", mode="공성", origin="장안", target="한중", troops=20000, generals=["하후연"],
+               strategy="한중 공략"),
+        Battle(kind="전투", mode="야전", origin="한중", target="장안", troops=18000, generals=["마초"],
+               strategy="길목에서 요격"),
+    ])
+    for _ in range(6):
+        if not s2.operations:
+            break
+        advance_turn(s2, [])
+    print("\n".join(s2.history[h0:][:10]))
 
 
 if __name__ == "__main__":

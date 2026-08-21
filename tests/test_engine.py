@@ -4,7 +4,7 @@
 """
 from src.models import Battle, City, Domestic, Faction, GameState, General
 from src.engine import (
-    _combat_round, _power, advance_turn, apply_domestic,
+    Force, _combat_round, _power, advance_turn, apply_domestic,
     check_victory, start_operation,
 )
 
@@ -34,11 +34,11 @@ def _mini_state() -> GameState:
 def test_power_monotonic():
     s = _mini_state()
     # 병력 많을수록 강함
-    assert _power(20000, [], s) > _power(10000, [], s)
+    assert _power(s, 20000, []) > _power(s, 10000, [])
     # 장수(통솔 91)가 붙으면 보정으로 더 강함
-    assert _power(10000, ["조운"], s) > _power(10000, [], s)
+    assert _power(s, 10000, ["조운"]) > _power(s, 10000, [])
     # 로스터에 없는 이름은 보정 0(환각 무시)
-    assert _power(10000, ["없는장수"], s) == _power(10000, [], s)
+    assert _power(s, 10000, ["없는장수"]) == _power(s, 10000, [])
 
 
 def test_power_uses_top_commander():
@@ -46,9 +46,9 @@ def test_power_uses_top_commander():
     s = _mini_state()
     s.generals["장비"] = General(name="장비", command=82)   # 조운 command 91
     # 조운(91)+장비(82) = 조운 단독과 동일(최고통솔만 반영)
-    assert _power(10000, ["조운", "장비"], s) == _power(10000, ["조운"], s)
+    assert _power(s, 10000, ["조운", "장비"]) == _power(s, 10000, ["조운"])
     # 통솔 낮은 장수 단독은 더 약함
-    assert _power(10000, ["장비"], s) < _power(10000, ["조운"], s)
+    assert _power(s, 10000, ["장비"]) < _power(s, 10000, ["조운"])
 
 
 def test_start_operation_clamps_overcommit():
@@ -161,6 +161,107 @@ def test_morale_hard_clamp_at_100():
 
 def test_combat_round_wall_helps_defender():
     s = _mini_state()
-    _, _, dom_nowall = _combat_round(10000, [], 10000, [], s, wall=0)
-    _, _, dom_wall = _combat_round(10000, [], 10000, [], s, wall=3)
+    _, _, dom_nowall = _combat_round(s, Force(10000, []), Force(10000, []))
+    _, _, dom_wall = _combat_round(s, Force(10000, []), Force(10000, [], wall=3))
     assert dom_nowall > dom_wall                        # 성벽이 방어 우세도 낮춤
+
+
+def test_morale_scales_power():
+    """사기 전투력 배수: 높을수록 강함, 기본 50은 중립(기존 계산 무영향)."""
+    s = _mini_state()
+    assert _power(s, 10000, [], morale=100) > _power(s, 10000, [], morale=50)
+    assert _power(s, 10000, [], morale=50) > _power(s, 10000, [], morale=0)
+    assert _power(s, 10000, [], morale=50) == _power(s, 10000, [])   # 기본 50 = 무보정
+
+
+def test_unit_morale_copies_faction_and_drops_on_combat():
+    """부대 사기 = 출전 시 전역 사기 복사 → 교전마다 소량 감소."""
+    s = _mini_state()
+    s.factions["촉"].morale = 70
+    start_operation(s, Battle(kind="전투", mode="공성", origin="성도", target="업", troops=8000))
+    op = s.operations[0]
+    assert op.unit_morale == 70                         # 출전 시 전역값 복사
+    advance_turn(s, [])                                 # 도착 + 공성 1라운드(같은 턴) → 사기 소모
+    assert op.unit_morale == 67                         # UNIT_MORALE_COMBAT_DROP=3
+
+
+def _relief_state() -> GameState:
+    """공성 협공 검증용: 촉이 위 성(견고)을 공성 → 위가 구에서 구원군 파병."""
+    return GameState(
+        cities={
+            "성": City(name="성", owner="위", troops=10000, wall=5, generals=["장료"]),
+            "구": City(name="구", owner="위", troops=8000, generals=["장합"]),   # 구원군 출발(성 인접)
+            "적": City(name="적", owner="촉", troops=30000, generals=["조운"]),  # 공성군 출발
+        },
+        factions={"위": Faction(name="위", ruler="장료"), "촉": Faction(name="촉", ruler="유비")},
+        generals={"장료": General(name="장료", command=90), "장합": General(name="장합", command=85),
+                  "조운": General(name="조운", command=91)},
+        distances={"성": {"구": 1, "적": 1}, "구": {"성": 1}, "적": {"성": 1}},
+        seed=1,
+    )
+
+
+def test_field_relief_pincers_besieger():
+    """구원군 야전 = 공성중 적 도시로 진군 → 도착 시 공성군과 야전 교전(구원). 공성군은 수성+구원군에 두 번 맞음."""
+    s = _relief_state()
+    advance_turn(s, [Battle(kind="전투", mode="공성", origin="적", target="성",
+                            troops=30000, generals=["조운"])])   # 개시+도착→공성(성 wall5=함락 X)
+    op = s.operations[0]
+    assert op.stage == "교전"
+    before = op.committed_troops
+    advance_turn(s, [Battle(kind="전투", mode="야전", origin="구", target="성",
+                            troops=8000, generals=["장합"])])
+    assert op.committed_troops < before                 # 수성 라운드 + 구원군 라운드 = 두 번 맞음
+    assert s.cities["성"].owner == "위"                  # 야전=점령 없음
+    assert s.cities["구"].troops == 0                    # 구원군은 진군(출격) = 병력 나감
+    assert any("[야전]" in h for h in s.history)         # 야전 교전 발생
+
+
+def test_field_op_with_no_enemy_returns_home():
+    """대상 도시에 적 공성군이 없으면 야전 출격군은 도착 즉시 복귀(병력 보존)."""
+    s = _relief_state()
+    advance_turn(s, [Battle(kind="전투", mode="야전", origin="구", target="성", troops=8000)])
+    assert s.cities["구"].troops == 8000                 # 출격→대상없음→복귀 = 순보존
+    assert any("출격 종료" in h for h in s.history)
+
+
+def _road_state() -> GameState:
+    """도로 요격 검증: 구(위)–누(촉) 거리2(마일스톤 존재)."""
+    return GameState(
+        cities={
+            "구": City(name="구", owner="위", troops=20000, generals=["장료"]),
+            "누": City(name="누", owner="촉", troops=15000, generals=["관우"]),
+        },
+        factions={"위": Faction(name="위", ruler="장료"), "촉": Faction(name="촉", ruler="관우")},
+        generals={"장료": General(name="장료", command=90), "관우": General(name="관우", command=95)},
+        distances={"구": {"누": 2}, "누": {"구": 2}},
+        seed=1,
+    )
+
+
+def test_field_intercept_on_road():
+    """거리2 도로에서 위 공성군(구→누)과 촉 요격군(누→구)이 교차(progress합≥거리) → 도로 교전, 아무도 성 도달 X."""
+    s = _road_state()
+    advance_turn(s, [
+        Battle(kind="전투", mode="공성", origin="구", target="누", troops=20000, generals=["장료"]),
+        Battle(kind="전투", mode="야전", origin="누", target="구", troops=12000, generals=["관우"]),
+    ])
+    assert any("[야전]" in h for h in s.history)         # 도로에서 교차 → 야전
+    assert s.cities["구"].owner == "위" and s.cities["누"].owner == "촉"  # 둘 다 성 도달 X
+    assert len(s.operations) == 2                       # 도로에서 교착(지속)
+
+
+def test_low_morale_triggers_retreat():
+    """부대 사기 임계(30) 붕괴 → 확률적 강제 퇴각(op 제거, 생존군 아군 도시 복귀)."""
+    s = _mini_state()
+    s.cities["업"].wall = 5                              # 튼튼 → 함락 안 됨, 교전 지속
+    start_operation(s, Battle(kind="전투", mode="공성", origin="성도", target="업", troops=6000))
+    advance_turn(s, [])                                 # 도착→교전(함락 X)
+    op = s.operations[0]
+    assert op.stage == "교전"
+    op.unit_morale = 1                                  # 다음 라운드 0 → prob=((30-0)/30)²=1 확정 퇴각
+    home_before = s.cities["성도"].troops
+    advance_turn(s, [])
+    assert len(s.operations) == 0                       # 퇴각으로 작전 소멸
+    assert any("[퇴각]" in h for h in s.history)
+    assert s.cities["성도"].troops > home_before        # 생존군 복귀(추가손실 후)
