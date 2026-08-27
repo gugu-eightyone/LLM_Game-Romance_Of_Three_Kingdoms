@@ -118,6 +118,34 @@ def test_sortie_returns_home_after_besieger_gone():
     assert "위연" in s.cities["한중"].generals
 
 
+def test_pre_arrival_sortie_engages_on_arrival():
+    """예비 출성: 적이 접근 중(이동)이어도 출성 가능 — 성 앞 대기, 도착 턴에 즉시 야전+감속."""
+    s = _mini_state()
+    start_operation(s, Battle(kind="전투", mode="공성", origin="업", target="한중",
+                              troops=15000, generals=["장료"]))       # 거리1, 이동 중
+    sortie = start_operation(s, Battle(kind="전투", mode="야전", origin="한중", target="한중",
+                                       troops=3000, generals=["위연"]))
+    assert sortie is not None and sortie.stage == "교전"   # 접근만으로 출성 성립(예비 포진)
+    advance_turn(s, [])                                    # 적 도착 → 공성 개시 → 같은 턴 야전 선타
+    assert any("[야전]" in h for h in s.history)
+    assert any("출성 견제" in h for h in s.history)         # 첫 공성 라운드부터 감속
+
+
+def test_sortie_disbands_when_threat_gone():
+    """성 앞 대기 중 위협 소멸(적 회군 등) → 출성 자동 해제, 수비대 복귀 합류."""
+    s = _mini_state()
+    enemy = start_operation(s, Battle(kind="전투", mode="공성", origin="업", target="한중",
+                                      troops=15000))
+    sortie = start_operation(s, Battle(kind="전투", mode="야전", origin="한중", target="한중",
+                                       troops=3000))
+    s.operations.remove(enemy)                             # 위협 인위 소멸(회군 가정)
+    before = s.cities["한중"].troops
+    advance_turn(s, [])
+    assert sortie not in s.operations
+    assert s.cities["한중"].troops == before + 3000        # 성내 재합류
+    assert any("출성 해제" in h for h in s.history)
+
+
 # ---------- 함락 시 잔존 수비병 퇴각 ----------
 def test_capture_survivors_retreat():
     """성벽 돌파 함락: 잔병×생존율이 인접 아군 도시로 퇴각(증발 아님)."""

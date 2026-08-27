@@ -95,6 +95,13 @@ def _combat_round(state: GameState, a: Force, b: Force) -> tuple[int, int, float
     return a_loss, b_loss, dominance
 
 
+def _city_threats(state: GameState, city: str, owner: str) -> list[ActiveOperation]:
+    """이 도시를 노리는 적 전투 작전(이동·교전 불문). decide의 피침 경보와 같은 술어 — 경보가 뜨면 출성도 성립."""
+    return [o for o in state.operations
+            if o.faction != owner and o.action.mode in ("공성", "야전")
+            and getattr(o.action, "target", None) == city]
+
+
 # ======================= 작전 개시 (검증=평가표면) =======================
 def start_operation(state: GameState, action: Battle,
                     actor: str | None = None) -> ActiveOperation | None:
@@ -112,12 +119,11 @@ def start_operation(state: GameState, action: Battle,
             f"[위반] {actor}가 남의 도시 '{action.origin}'({faction})에서 출병 시도 → 기각")
         return None
 
-    # 출성(태세, §9-20): origin==target 야전 = 성 앞 교전 중인 적이 있을 때만 성립.
-    # 수비대를 분할해 성벽 밖 교전(wall 포기) — 이동 없이 즉시 교전, ②술어가 공성군과 자동 페어링.
+    # 출성(태세, §9-20): origin==target 야전 = 피침 도시(적이 노리는 중, 접근 포함)에서만 성립.
+    # 수비대를 분할해 성 앞에 진 침(wall 포기) — 적 도착 즉시 ②술어가 페어링(예비 출성=첫 공성 라운드 선타).
     sortie = action.mode == "야전" and action.origin == action.target
-    if sortie and not any(o.faction != faction and o.stage == "교전" and o.action.target == action.origin
-                          for o in state.operations):
-        state.history.append(f"[기각] {faction} {action.origin} 출성 — 성 앞에 교전 중인 적 없음(수성은 자동)")
+    if sortie and not _city_threats(state, action.origin, faction):
+        state.history.append(f"[기각] {faction} {action.origin} 출성 — 이 도시를 노리는 적 없음(수성은 자동)")
         return None
     if not sortie and action.target not in state.distances.get(action.origin, {}):
         state.history.append(
@@ -169,7 +175,7 @@ def start_operation(state: GameState, action: Battle,
     state.next_op_id += 1
     state.operations.append(op)
     if sortie:
-        state.history.append(f"[작전{op.id}] {faction} {action.origin} 출성(성 앞 교전, 병력 {committed})")
+        state.history.append(f"[작전{op.id}] {faction} {action.origin} 출성(성 앞 포진, 병력 {committed})")
     else:
         tag = "·도하" if river else ""
         state.history.append(
@@ -516,9 +522,13 @@ def _resolve_combat(state: GameState) -> None:
         _resolve_op_end(state, op, n_opp.get(op.id, 0))
     engaged = {op.id for pair in pairs for op in pair}
     for op in list(state.operations):                # 야전 승자(교전 마치고 상대 소멸) → 자동 복귀(서브초이스2)
-        if (op.action.mode == "야전" and op.has_fought
-                and op.id not in engaged and op.committed_troops > 0):
+        if op.action.mode != "야전" or op.id in engaged or op.committed_troops <= 0:
+            continue
+        if op.has_fought:
             _return_home(state, op, "요격 완료")
+        elif (op.action.origin == op.action.target   # 대기 중 출성: 위협이 사라지면 성내 복귀(합류)
+              and not _city_threats(state, op.action.target, op.faction)):
+            _return_home(state, op, "출성 해제(위협 소멸)")
 
 
 def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int) -> None:
@@ -531,7 +541,8 @@ def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int) -> None
         elif op.action.mode != "호송":               # 장수 단독 호송(병력 0)은 정상 → 계속 간다
             _return_home(state, op, "격퇴" if op.action.mode == "공성" else "무위", troops=False)
         return
-    fighting = op.stage == "교전" or n_field > 0
+    # 야전(출성·구원 포함)은 실제 교전한 턴만 fighting — 성 앞 대기 중인 예비 출성이 퇴각 판정에 안 걸리게.
+    fighting = (op.stage == "교전" and op.action.mode == "공성") or n_field > 0
     if fighting and op.unit_morale < ROUT_MORALE_THRESHOLD:
         deficit = ROUT_MORALE_THRESHOLD - op.unit_morale
         if state.rng.random() < (deficit / ROUT_MORALE_THRESHOLD) ** 2:
