@@ -79,16 +79,29 @@ def _combat_round(state: GameState, a: Force, b: Force) -> tuple[int, int, float
 
 
 # ======================= 작전 개시 (검증=평가표면) =======================
-def start_operation(state: GameState, action: Battle) -> ActiveOperation | None:
-    """공성 진군 개시. 출발도시 보유와 대조 → 위반은 클램프+로깅(A·B층 카운트 표면)."""
+def start_operation(state: GameState, action: Battle,
+                    actor: str | None = None) -> ActiveOperation | None:
+    """공성 진군 개시. 출발도시 보유와 대조 → 위반은 클램프+로깅(A·B층 카운트 표면).
+
+    actor: 이 행동을 낸 세력. 주면 남의 도시에서 출병시키는 월권을 기각(LLM 경로).
+    """
     origin = state.cities.get(action.origin)
     if origin is None:
         state.history.append(f"[기각] 출발도시 '{action.origin}' 없음")
         return None
     faction = origin.owner
+    if actor is not None and faction != actor:
+        state.history.append(
+            f"[위반] {actor}가 남의 도시 '{action.origin}'({faction})에서 출병 시도 → 기각")
+        return None
     if action.target not in state.distances.get(action.origin, {}):
         state.history.append(
             f"[위반] {faction} {action.origin}→{action.target} 비인접 진군(순간이동 시도) → 기각")
+        return None
+
+    # 공성은 남의 도시에만. 야전은 target이 "방면"이라 아군 도시 방향도 정당(=구원군 출격).
+    if action.mode == "공성" and state.cities[action.target].owner == faction:
+        state.history.append(f"[기각] {faction} 자국 도시 '{action.target}' 공성 시도")
         return None
 
     committed = min(action.troops, origin.troops)
@@ -129,10 +142,13 @@ def start_operation(state: GameState, action: Battle) -> ActiveOperation | None:
 
 
 # ======================= 내정 (즉시 해소) =======================
-def apply_domestic(state: GameState, action: Domestic) -> None:
+def apply_domestic(state: GameState, action: Domestic, actor: str | None = None) -> None:
     city = state.cities.get(action.city)
     if city is None:
         state.history.append(f"[기각] 내정 도시 '{action.city}' 없음")
+        return
+    if actor is not None and city.owner != actor:
+        state.history.append(f"[위반] {actor}가 남의 도시 '{action.city}'({city.owner}) 내정 시도 → 기각")
         return
     spend = min(action.gold_spent, city.gold)
     city.gold -= spend
@@ -450,19 +466,24 @@ def check_victory(state: GameState) -> None:
 
 
 # ======================= 턴 오케스트레이션 =======================
-def _dispatch(state: GameState, action) -> None:
+def _dispatch(state: GameState, action, actor: str | None = None) -> None:
     if isinstance(action, Domestic):
-        apply_domestic(state, action)
+        apply_domestic(state, action, actor)
     elif isinstance(action, Battle):
-        start_operation(state, action)               # 공성·야전 모두 진군 작전으로 개시
+        start_operation(state, action, actor)        # 공성·야전 모두 진군 작전으로 개시
     elif isinstance(action, Scheme):
         state.history.append(f"[증분2] 계략({action.scheme_type}) 미구현 → 무시")
 
 
-def advance_turn(state: GameState, actions: list) -> None:
-    """한 달 진행: 개시/내정 → 이동(마일스톤) → 전투 해소(야전·공성·퇴각·포로) → 승리 → 시간."""
-    for a in actions:
-        _dispatch(state, a)
+def advance_turn(state: GameState, actions: list | dict) -> None:
+    """한 달 진행: 개시/내정 → 이동(마일스톤) → 전투 해소(야전·공성·퇴각·포로) → 승리 → 시간.
+
+    actions: `{세력: Action}` dict면 행위자 소유권까지 검증(LLM 경로),
+             그냥 list면 검증 생략(스크립트 데모·테스트가 상태를 직접 짜는 경우).
+    """
+    items = actions.items() if isinstance(actions, dict) else ((None, a) for a in actions)
+    for actor, a in items:
+        _dispatch(state, a, actor)
     _advance_movement(state)                          # 이동중 작전 진행(필드 교전=고정)
     _resolve_combat(state)                            # 야전 쌍 → 공성 → 종료 판정
     check_victory(state)
