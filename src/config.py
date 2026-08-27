@@ -28,6 +28,10 @@ SIEGE_BASE = 2                   # 교전 threshold = SIEGE_BASE + 성벽레벨.
 # --- 내정 ---
 DOMESTIC_GAIN = 2                # 금 1 지출 → 식량/병력 2 (모병·식량증산).
 
+# --- 호송/명령 상한 (2026-08-27) ---
+ESCORT_MIN_TROOPS = 200          # 병사·물자·포로 호송 최소 호위 병력. 장수 단독 이동은 면제.
+MAX_ORDERS_PER_TURN = 4          # 세력당 턴 명령 상한(LLM 폭주 안전핀). 초과분 잘라내고 [환각] 로깅(A층 표면).
+
 # --- 포로화 ---
 CAPTURE_FLOOR = 0.2              # 포획확률 최솟값(가산 아님). 포획확률 = max(FLOOR, 포위도²). [[DISCUSSION#9-10]]
 

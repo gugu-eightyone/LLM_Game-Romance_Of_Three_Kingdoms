@@ -45,6 +45,7 @@ class General(BaseModel):
     might: int = 50          # 무력 = 일기토(개인 무예). 일기토 시스템 붙을 때까지 휴면
     intel: int = 50          # 지력 = 계략·정보(안개). 증분2 배선
     is_ruler: bool = False   # 군주 플래그. 포획 시 세력 자동 승계 트리거(멸망은 도시0일 때만). [[DISCUSSION#9-16]]
+    faction: str = ""        # 소속 세력. 시나리오 로드 시 시작 주둔 도시 소유주로 파생(등용 시 갱신). 포로 해방 복귀지 판정용.
 
 
 class ActiveOperation(BaseModel):
@@ -63,6 +64,10 @@ class ActiveOperation(BaseModel):
     committed_generals: list[str] = Field(default_factory=list)  # 검증된 동행 장수
     unit_morale: int = 50                         # 부대 사기: 출전 시 전역 사기 복사→독립. 전투력 배수·매교전 소량 감소. [[DISCUSSION#9-10]]
     has_fought: bool = False                      # 야전 교전 1회+ 경험. True인 야전 op는 상대 소멸 시 출격 종료→복귀(공성은 임무 재개). [[DISCUSSION#9-10]]
+    # --- 호송 화물(호송 op만 사용, 전투 op는 전부 0/빈) ---
+    cargo_gold: int = 0
+    cargo_food: int = 0
+    cargo_prisoners: list[str] = Field(default_factory=list)
 
 
 class GameState(BaseModel):
@@ -120,13 +125,30 @@ class Domestic(BaseModel):
     city: str                                    # 자국 도시
     item: Literal["식량증산", "모병", "사기진작", "성벽보수"]
     gold_spent: int = 0                           # 투입병력·대상적 없음
+    strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)  # 표현만 자연어(효과는 item+gold 결정론). 심판 채점 재료.
+
+
+class Transfer(BaseModel):
+    """호송: 병사·장수·포로·금·식량을 인접 아군 도시로 이동. 도착·요격 해소는 엔진.
+
+    호위 규칙(엔진 검증): 병사·물자·포로를 실으면 최소 ESCORT_MIN_TROOPS, 장수 단독은 면제.
+    """
+    kind: Literal["호송"]
+    mode: Literal["호송"] = "호송"                # 엔진 op.action.mode 분기 공용(공성/야전과 한 축)
+    origin: str
+    target: str                                  # 인접 아군 도시만
+    troops: int = 0
+    generals: list[str] = Field(default_factory=list)
+    prisoners: list[str] = Field(default_factory=list)
+    gold: int = 0
+    food: int = 0
 
 
 # 개념상 discriminated union(종류별 필드 다름)이나, discriminator를 스키마에 박으면
 # pydantic이 `oneOf`를 내고 → OpenAI 구조화출력이 이를 거부(anyOf만 허용, 스모크로 확인).
 # 세 변형의 `kind` 리터럴이 서로 겹치지 않아 discriminator 없는 평범한 Union으로도
 # 판별이 정확·유일함(잘못된 조합은 그대로 거부). → anyOf로 나가 OpenAI 통과.
-Action = Union[Battle, Scheme, Domestic]
+Action = Union[Battle, Scheme, Domestic, Transfer]
 ActionAdapter = TypeAdapter(Action)              # dict → 올바른 변형으로 파싱·검증
 
 

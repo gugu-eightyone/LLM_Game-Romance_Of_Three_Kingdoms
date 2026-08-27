@@ -18,17 +18,20 @@ from .models import Action, Domestic, FactionName, GameState
 
 
 class Decision(BaseModel):
-    """구조화출력 래퍼. Union을 property로 내리기 위한 껍데기 한 겹."""
-    action: Action
+    """구조화출력 래퍼. Union을 property로 내리기 위한 껍데기 한 겹 + 멀티 명령 목록."""
+    actions: list[Action]                    # 1~4건. 상한 강제는 엔진(초과=[환각] 로깅, A층 표면)
 
 
-SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 주어진 정세를 읽고 이번 달 행동 하나를 정하라.
+SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 주어진 정세를 읽고 이번 달 명령 목록(1~4건)을 정하라.
 
-규칙(어기면 기각되어 한 달을 버린다):
+규칙(어기면 그 명령은 기각된다):
+- 명령은 적힌 순서대로 즉시 처리된다(예: 모병을 먼저 적으면 그 병력으로 같은 달 출격 가능).
 - 전투는 반드시 **우리 도시**에서 출발하고, 목표는 그 도시의 **인접 목록에 있는 도시**여야 한다.
 - 투입 병력은 출발 도시의 보유 병력 이내. 동행 장수는 그 도시에 주둔한 장수만.
 - mode 공성 = **다른 세력의** 인접 도시를 점령한다(우리 도시는 공성 대상이 아니다). mode 야전 = 적 방면으로 출격해 진군 중인 적 부대를 길목에서
   요격한다(거리 2개월 이상인 도로에서만 마주친다).
+- 호송(kind=호송) = 병사·장수·포로·금·식량을 **인접한 우리 도시**로 보낸다. 병사·물자·포로를 실으면
+  호위 병사 200 이상 동원. 장수만 보낼 땐 병사 0도 된다.
 - 내정은 우리 도시에 금을 투입한다. 식량증산·모병(금 1 → 2), 성벽보수, 사기진작.
 - 이미 진행 중인 작전은 저절로 계속된다. 같은 작전을 다시 명령하지 마라(병력만 낭비된다).
 - 계략(kind=계략)은 아직 미구현이니 절대 고르지 마라.
@@ -74,31 +77,31 @@ def brief(state: GameState, faction: FactionName) -> str:
 
 
 def _fallback(state: GameState, faction: FactionName) -> Decision | None:
-    """호출이 다 실패했을 때 반환할 무해한 행동 — 금 0 지출 내정(상태 무변, 로그만)."""
+    """호출이 다 실패했을 때 반환할 무해한 명령 — 금 0 지출 내정(상태 무변, 로그만)."""
     mine = [n for n, c in state.cities.items() if c.owner == faction]
     if not mine:
         return None
-    return Decision(action=Domestic(kind="내정", city=mine[0], item="식량증산", gold_spent=0))
+    return Decision(actions=[Domestic(kind="내정", city=mine[0], item="식량증산", gold_spent=0)])
 
 
-def decide(state: GameState, faction: FactionName) -> Action | None:
-    """한 세력의 이번 달 행동. 도시가 없으면 None(행동할 주체가 없음)."""
+def decide(state: GameState, faction: FactionName) -> list[Action] | None:
+    """한 세력의 이번 달 명령 목록. 도시가 없으면 None(행동할 주체가 없음)."""
     fb = _fallback(state, faction)
     if fb is None:
         return None
     return structured_complete(
         Decision, SYSTEM.format(faction=faction), brief(state, faction), fallback=fb
-    ).action
+    ).actions
 
 
-def decide_all(state: GameState) -> dict[FactionName, Action]:
-    """살아있는 전 세력의 행동. `advance_turn(state, 이 dict)`에 그대로 넣으면 소유권까지 검증됨."""
-    out: dict[FactionName, Action] = {}
+def decide_all(state: GameState) -> dict[FactionName, list[Action]]:
+    """살아있는 전 세력의 명령. `advance_turn(state, 이 dict)`에 그대로 넣으면 소유권·상한까지 검증됨."""
+    out: dict[FactionName, list[Action]] = {}
     for name, f in state.factions.items():
         if not f.alive:
             continue
         a = decide(state, name)
-        if a is not None:
+        if a:
             out[name] = a
     return out
 
@@ -111,8 +114,9 @@ def demo(turns: int = 6) -> None:
     for t in range(turns):
         h0 = len(state.history)
         actions = decide_all(state)
-        for f, a in actions.items():
-            print(f"  {f}: {a.model_dump_json(exclude_defaults=True)}")
+        for f, acts in actions.items():
+            for a in acts:
+                print(f"  {f}: {a.model_dump_json(exclude_defaults=True)}")
         advance_turn(state, actions)
         print(f"[{state.year}년 {state.month}월 종료]")
         print("\n".join(state.history[h0:]) or "  (변화 없음)")

@@ -36,9 +36,9 @@ def test_brief_shows_own_adjacency_and_enemy():
 def test_fallback_is_harmless_and_valid():
     s = _mini_state()
     d = _fallback(s, "촉")
-    assert isinstance(d.action, Domestic) and d.action.gold_spent == 0
+    assert isinstance(d.actions[0], Domestic) and d.actions[0].gold_spent == 0
     before = (s.cities["성도"].gold, s.cities["성도"].food)
-    advance_turn(s, {"촉": d.action})
+    advance_turn(s, {"촉": d.actions})
     assert (s.cities["성도"].gold, s.cities["성도"].food) == before   # 상태 무변
 
 
@@ -72,13 +72,15 @@ def test_list_path_still_unguarded():
 
 
 def test_decision_wrapper_accepts_all_action_kinds():
-    """Union을 property로 내린 래퍼가 세 변형을 다 판별한다(구조화출력 스키마의 형태)."""
+    """Union을 property로 내린 래퍼가 네 변형을 다 판별한다(구조화출력 스키마의 형태)."""
     for payload in (
         {"kind": "전투", "mode": "공성", "origin": "성도", "target": "업", "troops": 100},
         {"kind": "내정", "city": "성도", "item": "모병", "gold_spent": 100},
         {"kind": "계략", "target_faction": "위", "scheme_type": "밀정"},
+        {"kind": "호송", "origin": "성도", "target": "한중", "troops": 500},
     ):
-        assert Decision.model_validate({"action": payload}).action.kind == payload["kind"]
+        d = Decision.model_validate({"actions": [payload]})
+        assert d.actions[0].kind == payload["kind"]
 
 
 def test_rejects_self_siege_but_allows_friendly_field():

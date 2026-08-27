@@ -14,14 +14,15 @@ import json
 from pathlib import Path
 from typing import NamedTuple
 
-from .models import ActiveOperation, Battle, Domestic, GameState, Scheme
+from .models import ActiveOperation, Battle, Domestic, GameState, Scheme, Transfer
 
 # 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
 from .config import (
-    ATTRITION_RATE, CAPTURE_FLOOR, DEFAULT_SPEED, DOMESTIC_GAIN, FACTION_SPEED,
-    FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE, MORALE_COMBAT_BAND,
-    PREP_CAP, PREP_RATE, RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE,
-    SIEGE_RATE, UNIT_MORALE_COMBAT_DROP, WALL_DEFENSE,
+    ATTRITION_RATE, CAPTURE_FLOOR, DEFAULT_SPEED, DOMESTIC_GAIN, ESCORT_MIN_TROOPS,
+    FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
+    MAX_ORDERS_PER_TURN, MORALE_COMBAT_BAND, PREP_CAP, PREP_RATE,
+    RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE, SIEGE_RATE,
+    UNIT_MORALE_COMBAT_DROP, WALL_DEFENSE,
 )
 
 SCENARIO_PATH = Path(__file__).resolve().parent.parent / "data" / "scenario.json"
@@ -32,7 +33,12 @@ def load_scenario(path: Path | str = SCENARIO_PATH) -> GameState:
     """시나리오 JSON → 검증된 GameState. (내가 짠 데이터지만 오타 잡게 Pydantic 통과.)"""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     raw.pop("_comment", None)
-    return GameState.model_validate(raw)
+    state = GameState.model_validate(raw)
+    for c in state.cities.values():                  # 로스터 소속 = 시작 주둔 도시 소유주(등용 시 갱신)
+        for g in c.generals:
+            if g in state.generals and not state.generals[g].faction:
+                state.generals[g].faction = c.owner
+    return state
 
 
 # ======================= 지형 =======================
@@ -165,6 +171,75 @@ def apply_domestic(state: GameState, action: Domestic, actor: str | None = None)
     state.history.append(f"[내정] {city.owner} {action.city} {action.item}(금 {spend})")
 
 
+# ======================= 호송 (인접 아군 도시 간 자원 이동) =======================
+def start_transfer(state: GameState, action: Transfer, actor: str | None = None) -> ActiveOperation | None:
+    """호송 개시: 병사·장수·포로·금·식량을 인접 아군 도시로. 위반=기각/클램프+로깅(A·B층).
+
+    이동은 전투 출격과 같은 작전 인프라를 탄다(강 도하 지연 포함) → 간선이 전선화되면 요격도 걸린다.
+    """
+    origin = state.cities.get(action.origin)
+    if origin is None:
+        state.history.append(f"[기각] 출발도시 '{action.origin}' 없음")
+        return None
+    faction = origin.owner
+    if actor is not None and faction != actor:
+        state.history.append(f"[위반] {actor}가 남의 도시 '{action.origin}'({faction})에서 호송 시도 → 기각")
+        return None
+    dest = state.cities.get(action.target)
+    if dest is None or action.target not in state.distances.get(action.origin, {}):
+        state.history.append(f"[위반] {faction} {action.origin}→{action.target} 비인접 호송 → 기각")
+        return None
+    if dest.owner != faction:
+        state.history.append(f"[기각] {faction} 호송 목적지 '{action.target}'({dest.owner})는 아군 도시 아님")
+        return None
+
+    troops = max(0, min(action.troops, origin.troops))
+    gold = max(0, min(action.gold, origin.gold))
+    food = max(0, min(action.food, origin.food))
+    if (troops, gold, food) != (action.troops, action.gold, action.food):
+        state.history.append(f"[환각] {faction} 호송 적재량이 보유 초과/음수 → 클램프")
+    gens = [g for g in action.generals if g in origin.generals]
+    pris = [p for p in action.prisoners if p in origin.prisoners]
+    dropped = [x for x in (*action.generals, *action.prisoners) if x not in (*gens, *pris)]
+    if dropped:
+        state.history.append(f"[환각] {faction} 호송 미보유 장수/포로 {dropped} 제외")
+    if not (troops or gold or food or gens or pris):
+        state.history.append(f"[기각] {faction} 빈 호송")
+        return None
+    if (troops or gold or food or pris) and troops < ESCORT_MIN_TROOPS:
+        state.history.append(
+            f"[기각] {faction} 호송 호위 부족(병력 {troops} < {ESCORT_MIN_TROOPS}) — 장수 단독만 무호위 가능")
+        return None
+
+    origin.troops -= troops
+    origin.gold -= gold
+    origin.food -= food
+    for g in gens:
+        origin.generals.remove(g)
+    for p in pris:
+        origin.prisoners.remove(p)
+
+    dist = float(state.distances[action.origin][action.target])
+    if _is_river(state, action.origin, action.target) and faction != "오":
+        dist += RIVER_CROSS_PENALTY
+    fac = state.factions.get(faction)
+    op = ActiveOperation(
+        id=state.next_op_id, faction=faction, action=action,
+        stage="이동", progress=0, threshold=dist,
+        committed_troops=troops, committed_generals=gens,
+        cargo_gold=gold, cargo_food=food, cargo_prisoners=pris,
+        unit_morale=fac.morale if fac else 50,
+    )
+    state.next_op_id += 1
+    state.operations.append(op)
+    load = "·".join(x for x in (
+        f"병{troops}" if troops else "", f"금{gold}" if gold else "", f"식{food}" if food else "",
+        f"장수 {','.join(gens)}" if gens else "", f"포로 {','.join(pris)}" if pris else "") if x)
+    state.history.append(
+        f"[작전{op.id}] {faction} 호송 {action.origin}→{action.target} ({load}, 거리 {dist:g}개월)")
+    return op
+
+
 # ======================= 이동 (마일스톤=암묵적, progress로 파생) =======================
 def _advance_movement(state: GameState) -> None:
     """이동중 작전 진행. 필드 교전 중(고정)이거나 야전 교전 마친(has_fought) op는 안 움직임.
@@ -187,6 +262,18 @@ def _arrive(state: GameState, op: ActiveOperation) -> None:
     city = state.cities.get(op.action.target)
     if city is None:
         state.history.append(f"[작전{op.id}] 대상 도시 소멸 → 취소")
+        state.operations.remove(op)
+        return
+    if op.action.mode == "호송":
+        if city.owner != op.faction:                  # 이동 중 목적지 함락 → 회군(화물째)
+            _return_home(state, op, "호송 취소(목적지 상실)")
+            return
+        city.troops += op.committed_troops
+        city.generals.extend(op.committed_generals)
+        city.prisoners.extend(op.cargo_prisoners)
+        city.gold += op.cargo_gold
+        city.food += op.cargo_food
+        state.history.append(f"[작전{op.id}] {op.faction} 호송 {city.name} 도착")
         state.operations.remove(op)
         return
     if op.action.mode == "공성":
@@ -361,8 +448,8 @@ def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int) -> None
         return
     if op.committed_troops <= 0:
         if n_field > 0:
-            _destroy_field_op(state, op, n_field)    # 야전 전멸 → 장수 포획(base×부대수)
-        else:
+            _destroy_field_op(state, op, n_field)    # 야전 전멸 → 장수 포획(base×부대수)·화물 노획
+        elif op.action.mode != "호송":               # 장수 단독 호송(병력 0)은 정상 → 계속 간다
             _return_home(state, op, "격퇴" if op.action.mode == "공성" else "무위", troops=False)
         return
     fighting = op.stage == "교전" or n_field > 0
@@ -399,13 +486,29 @@ def _nearest_enemy_city(state: GameState, op: ActiveOperation) -> str | None:
     return None
 
 
+def _nearest_city_of(state: GameState, op: ActiveOperation, faction: str) -> str | None:
+    """현 위치(간선 양끝) 기준 그 세력 소유 최근접 도시. 해방 포로 복귀지 판정."""
+    if not faction:
+        return None
+    for node in (op.action.target, op.action.origin):
+        for name in (node, *state.distances.get(node, {})):
+            c = state.cities.get(name)
+            if c and c.owner == faction:
+                return name
+    return None
+
+
 def _return_home(state: GameState, op: ActiveOperation, reason: str, troops: bool = True) -> None:
     """출격/작전 종료 → 생존군·장수 아군 도시 복귀. 고립(복귀지 없음)이면 장수 소실."""
     dest = _home_city(state, op)
     if dest:
+        c = state.cities[dest]
         if troops:
-            state.cities[dest].troops += max(0, op.committed_troops)
-        state.cities[dest].generals.extend(op.committed_generals)
+            c.troops += max(0, op.committed_troops)
+        c.generals.extend(op.committed_generals)
+        c.gold += op.cargo_gold                       # 호송 화물도 함께 귀환(전투 op는 전부 0)
+        c.food += op.cargo_food
+        c.prisoners.extend(op.cargo_prisoners)
     state.history.append(f"[작전{op.id}] {op.faction} {reason} → {dest or '복귀 실패(고립)'}")
     if op in state.operations:
         state.operations.remove(op)
@@ -420,8 +523,12 @@ def _retreat_op(state: GameState, op: ActiveOperation) -> None:
     if dest is None:
         return
     op.committed_troops -= round(op.committed_troops * FIELD_RETREAT_LOSS)
-    state.cities[dest].troops += max(0, op.committed_troops)
-    state.cities[dest].generals.extend(op.committed_generals)
+    c = state.cities[dest]
+    c.troops += max(0, op.committed_troops)
+    c.generals.extend(op.committed_generals)
+    c.gold += op.cargo_gold                           # 호송 화물도 함께 퇴각(전투 op는 전부 0)
+    c.food += op.cargo_food
+    c.prisoners.extend(op.cargo_prisoners)
     state.history.append(f"[퇴각] {op.faction} 작전{op.id} 사기 붕괴(사기 {op.unit_morale}) → {dest}")
     state.operations.remove(op)
 
@@ -449,6 +556,18 @@ def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int) -> No
             state.history.append(f"  ↳ {g} 야전 포로 → {jail}")
         elif home:
             state.cities[home].generals.append(g)     # 포획 실패 → 아군 복귀
+    if jail and (op.cargo_gold or op.cargo_food):     # 호송 화물 = 요격측 노획
+        state.cities[jail].gold += op.cargo_gold
+        state.cities[jail].food += op.cargo_food
+        state.history.append(f"  ↳ 화물 노획(금{op.cargo_gold}·식{op.cargo_food}) → {jail}")
+    for p in op.cargo_prisoners:                      # 호송 중 포로 = 해방 → 원 세력 최근접 도시
+        pf = state.generals[p].faction if p in state.generals else ""
+        free = _nearest_city_of(state, op, pf)
+        if free:
+            state.cities[free].generals.append(p)
+            state.history.append(f"  ↳ 포로 {p} 해방 → {free}")
+        elif jail:                                    # 원 세력 도시 없음(소멸 등) → 재수감
+            state.cities[jail].prisoners.append(p)
     state.history.append(f"[야전 전멸] {op.faction} 작전{op.id} 궤멸")
     state.operations.remove(op)
     if ruler_lost and state.factions.get(op.faction) and state.factions[op.faction].alive:
@@ -471,6 +590,8 @@ def _dispatch(state: GameState, action, actor: str | None = None) -> None:
         apply_domestic(state, action, actor)
     elif isinstance(action, Battle):
         start_operation(state, action, actor)        # 공성·야전 모두 진군 작전으로 개시
+    elif isinstance(action, Transfer):
+        start_transfer(state, action, actor)
     elif isinstance(action, Scheme):
         state.history.append(f"[증분2] 계략({action.scheme_type}) 미구현 → 무시")
 
@@ -478,10 +599,21 @@ def _dispatch(state: GameState, action, actor: str | None = None) -> None:
 def advance_turn(state: GameState, actions: list | dict) -> None:
     """한 달 진행: 개시/내정 → 이동(마일스톤) → 전투 해소(야전·공성·퇴각·포로) → 승리 → 시간.
 
-    actions: `{세력: Action}` dict면 행위자 소유권까지 검증(LLM 경로),
+    actions: `{세력: Action | list[Action]}` dict면 행위자 소유권 검증 + 명령 상한(LLM 경로),
              그냥 list면 검증 생략(스크립트 데모·테스트가 상태를 직접 짜는 경우).
+    명령은 적힌 순서대로 즉시 처리(모병 → 그 병력으로 같은 턴 출격 가능).
     """
-    items = actions.items() if isinstance(actions, dict) else ((None, a) for a in actions)
+    if isinstance(actions, dict):
+        items = []
+        for actor, acts in actions.items():
+            acts = list(acts) if isinstance(acts, list) else [acts]
+            if len(acts) > MAX_ORDERS_PER_TURN:
+                state.history.append(
+                    f"[환각] {actor} 명령 {len(acts)}건 > 상한 {MAX_ORDERS_PER_TURN} → 초과분 무시")
+                acts = acts[:MAX_ORDERS_PER_TURN]
+            items.extend((actor, a) for a in acts)
+    else:
+        items = [(None, a) for a in actions]
     for actor, a in items:
         _dispatch(state, a, actor)
     _advance_movement(state)                          # 이동중 작전 진행(필드 교전=고정)
