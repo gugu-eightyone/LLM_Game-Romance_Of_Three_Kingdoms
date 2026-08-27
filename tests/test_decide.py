@@ -33,6 +33,15 @@ def test_brief_shows_own_adjacency_and_enemy():
     assert "금4000" not in text                            # 적 도시 금은 안 실림(토큰 절약)
 
 
+def test_brief_shows_invasion_alert():
+    """내 도시를 노리는 적 작전이 있으면 그 도시 줄에 ⚠피침 경보가 결정론으로 붙는다."""
+    s = _mini_state()
+    advance_turn(s, [Battle(kind="전투", mode="공성", origin="업", target="성도", troops=3000)])
+    text = brief(s, "촉")
+    assert "⚠피침" in text and "위군" in text               # 촉 눈에 경보
+    assert "⚠피침" not in brief(s, "위")                    # 공격자 눈엔 없음(자국 도시 아님)
+
+
 def test_fallback_is_harmless_and_valid():
     s = _mini_state()
     d = _fallback(s, "촉")
@@ -95,4 +104,5 @@ def test_rejects_self_siege_but_allows_friendly_field():
 
     advance_turn(s, {"촉": Battle(kind="전투", mode="야전", origin="성도", target="낙양", troops=1000)})
     assert any("진군 개시" in h for h in s.history)          # 출격은 성립(구원군)
-    assert s.cities["성도"].troops == 10000                   # 거리1 → 같은 턴 도착·대상없음·복귀
+    assert s.cities["낙양"].troops == 2000                    # 거리1 → 같은 턴 도착·적 없음 → 주둔(합류)
+    assert s.cities["성도"].troops == 9000

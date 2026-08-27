@@ -85,3 +85,17 @@ def test_unknown_op_id_rejected():
     s = _state()
     advance_turn(s, {"촉": OpCommand(kind="작전지시", op_id=99, order="회군")})
     assert any("[기각]" in h and "작전99" in h for h in s.history)
+
+
+def test_troops_seen_check_field():
+    """검산 칸: 보유량과 다르게 베껴 적으면 [검산 불일치] 카운트(명령 자체는 정상 처리), 맞으면 무음, 미기재(-1)도 무음."""
+    s = _state()
+    advance_turn(s, {"촉": Battle(kind="전투", mode="공성", origin="성도", target="업",
+                                   troops=3000, origin_troops_seen=99999)})
+    assert any("[검산 불일치]" in h for h in s.history)
+    assert len(s.operations) == 1                      # 위반은 세되, 출격은 성립
+
+    s2 = _state()
+    advance_turn(s2, {"촉": Battle(kind="전투", mode="공성", origin="성도", target="업",
+                                    troops=3000, origin_troops_seen=10000)})
+    assert not any("[검산 불일치]" in h for h in s2.history)

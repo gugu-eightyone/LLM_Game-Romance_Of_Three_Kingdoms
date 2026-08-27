@@ -217,11 +217,23 @@ def test_field_relief_pincers_besieger():
     assert any("[야전]" in h for h in s.history)         # 야전 교전 발생
 
 
-def test_field_op_with_no_enemy_returns_home():
-    """대상 도시에 적 공성군이 없으면 야전 출격군은 도착 즉시 복귀(병력 보존)."""
+def test_field_op_garrisons_at_own_city_when_no_enemy():
+    """아군 도시로 간 구원군은 적이 아직 없으면 그 도시에 주둔(합류) — 선제 증원(헛걸음 복귀 폐지)."""
     s = _relief_state()
-    advance_turn(s, [Battle(kind="전투", mode="야전", origin="구", target="성", troops=8000)])
-    assert s.cities["구"].troops == 8000                 # 출격→대상없음→복귀 = 순보존
+    advance_turn(s, [Battle(kind="전투", mode="야전", origin="구", target="성", troops=8000,
+                            generals=["장합"])])
+    assert s.cities["성"].troops == 18000                # 10000 + 8000 합류
+    assert "장합" in s.cities["성"].generals
+    assert s.cities["구"].troops == 0
+    assert any("주둔(합류" in h for h in s.history)
+
+
+def test_field_op_to_enemy_city_with_no_target_returns_home():
+    """적 도시 방면 요격인데 싸울 적이 없으면 종전대로 복귀(주둔은 아군 도시만)."""
+    s = _relief_state()
+    advance_turn(s, [Battle(kind="전투", mode="야전", origin="적", target="성", troops=8000)])
+    assert s.cities["적"].troops == 30000                # 출격→대상없음→복귀 = 순보존
+    assert s.cities["성"].owner == "위" and s.cities["성"].troops == 10000  # 합류·점령 없음
     assert any("출격 종료" in h for h in s.history)
 
 

@@ -119,6 +119,11 @@ def start_operation(state: GameState, action: Battle,
         state.history.append(f"[기각] {faction} 자국 도시 '{action.target}' 공성 시도")
         return None
 
+    # 검산 칸 대조(측정 표면): 같은 턴 앞선 모병으로 보유가 브리핑과 달라진 경우도 불일치로 찍힘 — 집계 시 감안.
+    if action.origin_troops_seen >= 0 and action.origin_troops_seen != origin.troops:
+        state.history.append(
+            f"[검산 불일치] {faction} {action.origin} 보유 {origin.troops} ≠ 기재 {action.origin_troops_seen}")
+
     committed = min(action.troops, origin.troops)
     if action.troops > origin.troops:
         state.history.append(
@@ -322,6 +327,11 @@ def _arrive(state: GameState, op: ActiveOperation) -> None:
         if besiegers:
             op.stage = "교전"                         # 도시서 야전 교전(수비대 안 침, 적 op만)
             state.history.append(f"[작전{op.id}] {op.faction} 구원군 {city.name} 도착 → 야전 교전")
+        elif city.owner == op.faction:                # 아군 도시 선제 구원 = 주둔(합류). 적보다 먼저 와도 헛걸음 없음
+            city.troops += op.committed_troops
+            city.generals.extend(op.committed_generals)
+            state.history.append(f"[작전{op.id}] {op.faction} 구원군 {city.name} 주둔(합류, 병력 {op.committed_troops})")
+            state.operations.remove(op)
         else:
             _return_home(state, op, "출격 종료(대상 없음)")
 

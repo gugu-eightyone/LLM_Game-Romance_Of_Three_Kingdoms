@@ -108,6 +108,8 @@ class Battle(BaseModel):
     mode: Literal["공성", "야전"]
     origin: str                                  # 출발도시(검증 기준: 병력·장수)
     target: str                                  # 공성=대상도시 / 야전=적 세력·방면
+    origin_troops_seen: int = -1                 # 검산 칸: 브리핑의 출발도시 보유 병력을 베껴 적기(투입량 아님).
+                                                 # 베껴 적는 행위가 보유량에 주의를 강제(과투입 환각 대책) + 불일치=측정 표면.
     troops: int
     generals: list[str] = Field(default_factory=list)
     strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
