@@ -17,8 +17,7 @@ from typing import Callable, TypeVar
 from openai import OpenAI
 from pydantic import BaseModel
 
-MODEL = "gpt-4.1-mini"   # 각국 결정·judge 공통(Q5). E층 검증 후 부족하면 승격.
-TEMPERATURE = 0.3        # 0.7→0.2→0.3(2026-08-27): 규칙 준수·숫자 대조가 주 임무라 저온. 서사 붙일 때 그쪽만 고온 분리.
+from .config import MODEL, TEMPERATURE   # 모델·온도 = 튜닝 손잡이라 config 한 곳으로(2026-08-27 이사)
 
 # T = "BaseModel을 상속한 어떤 Pydantic 클래스든" 자리 표시자.
 # 넣은 스키마 그대로 반환 타입으로 이어짐 → 호출부가 캐스팅 없이 타입힌트 받음.

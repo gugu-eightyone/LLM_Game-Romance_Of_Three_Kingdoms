@@ -22,7 +22,8 @@ from .config import (
     FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
     MAX_ORDERS_PER_TURN, MORALE_COMBAT_BAND, PREP_CAP, PREP_RATE,
     RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE, SIEGE_RATE,
-    UNIT_MORALE_COMBAT_DROP, WALL_DEFENSE,
+    SIEGE_RETREAT_SURVIVAL, SORTIE_SLOW_CAP, UNIT_MORALE_COMBAT_DROP,
+    WALL_DEFENSE, WALL_MANNING,
 )
 
 SCENARIO_PATH = Path(__file__).resolve().parent.parent / "data" / "scenario.json"
@@ -84,9 +85,10 @@ def _combat_round(state: GameState, a: Force, b: Force) -> tuple[int, int, float
 
     완전 대칭 — 역할(공/수)은 호출자가 우세도 부호로 해석(공성: a=공격, 우세도>0이면 진행도 누적).
     wall은 그 진영 축성 보너스(야전=0). morale=전투력 배수(미지정 50=중립 → 기존 무변).
+    성벽은 정원제 — min(wall, 병력/WALL_MANNING)레벨만 위력(빈 성벽 혼자 못 싸움 → 출성 배분 리스크). [[DISCUSSION#9-20]]
     """
-    ap = _power(state, a.troops, a.generals, a.morale) + a.wall * WALL_DEFENSE
-    bp = _power(state, b.troops, b.generals, b.morale) + b.wall * WALL_DEFENSE
+    ap = _power(state, a.troops, a.generals, a.morale) + min(a.wall, a.troops / WALL_MANNING) * WALL_DEFENSE
+    bp = _power(state, b.troops, b.generals, b.morale) + min(b.wall, b.troops / WALL_MANNING) * WALL_DEFENSE
     a_loss = min(a.troops, round(bp * ATTRITION_RATE))
     b_loss = min(b.troops, round(ap * ATTRITION_RATE))
     dominance = (ap / bp - 1) if bp > 0 else 999.0
@@ -109,7 +111,15 @@ def start_operation(state: GameState, action: Battle,
         state.history.append(
             f"[위반] {actor}가 남의 도시 '{action.origin}'({faction})에서 출병 시도 → 기각")
         return None
-    if action.target not in state.distances.get(action.origin, {}):
+
+    # 출성(태세, §9-20): origin==target 야전 = 성 앞 교전 중인 적이 있을 때만 성립.
+    # 수비대를 분할해 성벽 밖 교전(wall 포기) — 이동 없이 즉시 교전, ②술어가 공성군과 자동 페어링.
+    sortie = action.mode == "야전" and action.origin == action.target
+    if sortie and not any(o.faction != faction and o.stage == "교전" and o.action.target == action.origin
+                          for o in state.operations):
+        state.history.append(f"[기각] {faction} {action.origin} 출성 — 성 앞에 교전 중인 적 없음(수성은 자동)")
+        return None
+    if not sortie and action.target not in state.distances.get(action.origin, {}):
         state.history.append(
             f"[위반] {faction} {action.origin}→{action.target} 비인접 진군(순간이동 시도) → 기각")
         return None
@@ -142,22 +152,28 @@ def start_operation(state: GameState, action: Battle,
     for g in valid:
         origin.generals.remove(g)
 
-    dist = float(state.distances[action.origin][action.target])
-    river = _is_river(state, action.origin, action.target)
-    if river and faction != "오":          # 위·촉 도하 지연(오는 수전이라 면제)
-        dist += RIVER_CROSS_PENALTY
+    if sortie:
+        dist, river = 0.0, False                      # 성 앞이라 이동 없음 → 즉시 교전
+    else:
+        dist = float(state.distances[action.origin][action.target])
+        river = _is_river(state, action.origin, action.target)
+        if river and faction != "오":      # 위·촉 도하 지연(오는 수전이라 면제)
+            dist += RIVER_CROSS_PENALTY
     fac = state.factions.get(faction)
     op = ActiveOperation(
         id=state.next_op_id, faction=faction, action=action,
-        stage="이동", progress=0, threshold=dist,
+        stage="교전" if sortie else "이동", progress=0, threshold=dist,
         committed_troops=committed, committed_generals=valid,
         unit_morale=fac.morale if fac else 50,       # 출전 시 전역 사기 복사→독립
     )
     state.next_op_id += 1
     state.operations.append(op)
-    tag = "·도하" if river else ""
-    state.history.append(
-        f"[작전{op.id}] {faction} {action.origin}→{action.target} 진군 개시(거리 {dist:g}개월{tag}, 병력 {committed})")
+    if sortie:
+        state.history.append(f"[작전{op.id}] {faction} {action.origin} 출성(성 앞 교전, 병력 {committed})")
+    else:
+        tag = "·도하" if river else ""
+        state.history.append(
+            f"[작전{op.id}] {faction} {action.origin}→{action.target} 진군 개시(거리 {dist:g}개월{tag}, 병력 {committed})")
     return op
 
 
@@ -356,10 +372,16 @@ def _siege_round(state: GameState, op: ActiveOperation) -> None:
     op.committed_troops -= atk_loss
     op.unit_morale = max(0, op.unit_morale - UNIT_MORALE_COMBAT_DROP)
     city.troops -= def_loss
-    op.progress += max(0, round(dominance * SIEGE_RATE))
+    # 출성 감속(§9-20): 성 앞 아군 출성 부대 규모에 비례해 공성 진행이 늦어진다(정지는 없음, 캡).
+    sortie_troops = sum(o.committed_troops for o in state.operations
+                        if o.faction == city.owner and o.stage == "교전"
+                        and o.action.mode == "야전" and o.action.origin == o.action.target == op.action.target)
+    slow = min(SORTIE_SLOW_CAP, sortie_troops / op.committed_troops) if sortie_troops and op.committed_troops > 0 else 0.0
+    op.progress += max(0, round(dominance * SIEGE_RATE * (1 - slow)))
+    slow_note = f", 출성 견제 −{slow:.0%}" if slow else ""
     state.history.append(                             # 라운드 가시화(F층 관측성·관전): 무음 공성 해소
         f"[작전{op.id}] {op.faction} {city.name} 공성 중 "
-        f"(진행 {op.progress:g}/{op.threshold:g}, 병력 {op.committed_troops} vs 수비 {city.troops})")
+        f"(진행 {op.progress:g}/{op.threshold:g}, 병력 {op.committed_troops} vs 수비 {city.troops}{slow_note})")
     if op.committed_troops > 0 and (city.troops <= 0 or op.progress >= op.threshold):
         _capture_city(state, op, city)
 
@@ -369,7 +391,8 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
 
     포위도 = 1 − (패자 소유 인접 도시 / 총 인접). 공격 출발지가 아군 아니라 항상 >0.
     포획확률 = max(CAPTURE_FLOOR, 포위도²)(볼록: 제대로 에워싸야 급증). 완전 포위=탈출로0=확정.
-    방어 병사는 증발(승자 생존군이 주둔), 장수만 탈출/포로. 군주 포획=승계 트리거(멸망은 도시0). [[DISCUSSION#9-10]]·[[DISCUSSION#9-16]]
+    성벽 돌파 함락(잔존병 있음) 시 잔병×생존율이 인접 아군 도시로 퇴각 — 완전 포위면 전멸.
+    장수는 탈출/포로 판정. 군주 포획=승계 트리거(멸망은 도시0). [[DISCUSSION#9-10]]·[[DISCUSSION#9-16]]
     """
     loser, winner = city.owner, op.faction
     defenders = list(city.generals)                 # 접수 전 방어 장수(군주 포함 가능)
@@ -381,11 +404,17 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
     encircle = 1 - len(escape_dests) / total
     capture_prob = max(CAPTURE_FLOOR, encircle ** 2)
 
-    # 도시 접수(금·식량=도시에 그대로=약탈, 병사=생존 공격군 주둔, 방어 병사 증발)
+    # 성벽 돌파 함락: 잔존 수비병은 증발 대신 퇴각(장수 탈출과 같은 포위 논리 — 퇴로 없으면 전멸)
+    survivors = round(city.troops * SIEGE_RETREAT_SURVIVAL) if city.troops > 0 and escape_dests else 0
+
+    # 도시 접수(금·식량=도시에 그대로=약탈, 병사=생존 공격군 주둔)
     city.owner = winner
     city.troops = op.committed_troops
     city.generals = list(op.committed_generals)
     state.history.append(f"[작전{op.id}] {winner}, {city.name} 함락 (구 {loser})")
+    if survivors:
+        state.cities[escape_dests[0]].troops += survivors
+        state.history.append(f"  ↳ 수비 잔병 {survivors} {escape_dests[0]}(으)로 퇴각")
     _chronicle(state, f"{winner}, {loser}의 {city.name} 함락")
     if op in state.operations:
         state.operations.remove(op)
