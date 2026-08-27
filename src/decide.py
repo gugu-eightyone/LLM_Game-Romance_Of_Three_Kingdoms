@@ -66,6 +66,8 @@ def brief(state: GameState, faction: FactionName) -> str:
     lines = [f"[{state.year}년 {state.month}월] 우리={faction}, 군주={f.ruler}, 사기={f.morale}",
              "[우리 도시]", *[_city_line(state, n, True) for n in mine],
              "[타 세력 도시]", *[_city_line(state, n, False) for n in other]]
+    if state.chronicle:                              # 주요 연혁 전량(굵직한 것만이라 짧음) — 원한·대세 기억용
+        lines += ["[주요 연혁]", *[f"- {c}" for c in state.chronicle]]
     if state.operations:
         lines.append("[진행 중 작전]")
         lines += [f"- [{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"

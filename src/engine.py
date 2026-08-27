@@ -41,6 +41,15 @@ def load_scenario(path: Path | str = SCENARIO_PATH) -> GameState:
     return state
 
 
+# ======================= 연혁 (주요 사건 영구 기록) =======================
+def _chronicle(state: GameState, event: str) -> None:
+    """주요 연혁 기록 — brief가 전량 노출(영구). 굵직한 사건만: 함락·군주 포획/승계·멸망·통일.
+
+    LLM 요약 대신 결정론 기록(누락 0·호출 0). 원한·복수 같은 해석은 LLM 역할극 몫.
+    """
+    state.chronicle.append(f"{state.year}년 {state.month}월: {event}")
+
+
 # ======================= 지형 =======================
 def _is_river(state: GameState, a: str, b: str) -> bool:
     """구간 (a,b)가 강인가(무순서). 도하 지연·증분2 수전 보정 판정."""
@@ -340,6 +349,7 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
     city.troops = op.committed_troops
     city.generals = list(op.committed_generals)
     state.history.append(f"[작전{op.id}] {winner}, {city.name} 함락 (구 {loser})")
+    _chronicle(state, f"{winner}, {loser}의 {city.name} 함락")
     if op in state.operations:
         state.operations.remove(op)
 
@@ -355,6 +365,7 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
             if gen is not None and gen.is_ruler:
                 gen.is_ruler = False
                 ruler_captured = True
+                _chronicle(state, f"{winner}, {loser} 군주 {g} 포획")
 
     lf = state.factions.get(loser)
     if lf is None or loser == "중립":
@@ -363,6 +374,7 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
     if not remaining:                                # 전 도시 상실 → 세력 소멸
         lf.alive = False
         state.history.append(f"⚔ {loser} 멸망 (전 도시 상실)")
+        _chronicle(state, f"{loser} 멸망")
     elif ruler_captured:                             # 군주 포획인데 도시 잔존 → 자동 승계
         _succeed_ruler(state, loser)
 
@@ -377,6 +389,7 @@ def _succeed_ruler(state: GameState, faction: str) -> None:
     state.generals[heir].is_ruler = True
     state.factions[faction].ruler = heir
     state.history.append(f"  ↳ {faction} {heir} 군주 승계")
+    _chronicle(state, f"{faction}, {heir} 군주 승계")
 
 
 # ======================= 야전 (지속 전투: 요격·구원군, 마일스톤=암묵) =======================
@@ -553,6 +566,7 @@ def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int) -> No
         if jail and state.rng.random() < prob:
             if _take_prisoner(state, jail, g):
                 ruler_lost = True
+                _chronicle(state, f"{op.faction} 군주 {g} 야전 포획")
             state.history.append(f"  ↳ {g} 야전 포로 → {jail}")
         elif home:
             state.cities[home].generals.append(g)     # 포획 실패 → 아군 복귀
@@ -582,6 +596,7 @@ def check_victory(state: GameState) -> None:
     if "중립" not in owners and len(non_neutral) == 1:
         state.winner = next(iter(non_neutral))
         state.history.append(f"★ {state.winner} 천하통일")
+        _chronicle(state, f"{state.winner} 천하통일")
 
 
 # ======================= 턴 오케스트레이션 =======================

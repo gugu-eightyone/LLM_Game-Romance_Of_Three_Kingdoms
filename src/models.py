@@ -85,6 +85,7 @@ class GameState(BaseModel):
     next_op_id: int = 1                          # 작전 id 발급 카운터
     winner: FactionName | None = None            # 승리 판정 결과(None=진행 중)
     history: list[str] = Field(default_factory=list)
+    chronicle: list[str] = Field(default_factory=list)  # 주요 연혁(함락·군주 포획/승계·처형·멸망). 영구 보존, brief 전량 노출 → "장비의 원수"를 LLM이 기억. 요약 LLM 불필요.
 
     _rng: random.Random | None = PrivateAttr(default=None)  # 엔진 소유 시드 RNG(직렬화 제외)
 
