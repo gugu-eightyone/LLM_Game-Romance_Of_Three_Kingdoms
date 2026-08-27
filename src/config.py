@@ -6,7 +6,7 @@
 
 # --- 전략 서술(LLM) ---
 STRATEGY_MAX_CHARS = 50          # 전략 자유서술 상한. 담화 아닌 지시라 짧게. [[DISCUSSION#9-8]]
-STRATEGY_MODIFIER_BOUND = 0.15   # judge 전략점수 → 전투 보정 상한(±). 결정론 코어가 지배하도록. (judge 미배선)
+STRATEGY_MODIFIER_BOUND = 0.30   # judge 전략점수 → 전투 보정 상한(±). 0.15→0.30 상향(2026-08-27): 작전지시(전략 갱신) 플레이의 보상 = 사기 밴드와 동급 레버. 어뷰징 방어=로그 곡선·상태 정합성 채점(§9-12). (judge 미배선)
 
 # --- 이동/지형 ---
 FACTION_SPEED = {"오": 1.25}     # 진군 진행도/월(세력별). 미지정=DEFAULT_SPEED. 오=장강 고속. [[DISCUSSION#9-9]]

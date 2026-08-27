@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import NamedTuple
 
-from .models import ActiveOperation, Battle, Domestic, GameState, Scheme, Transfer
+from .models import ActiveOperation, Battle, Domestic, GameState, OpCommand, Scheme, Transfer
 
 # 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
 from .config import (
@@ -249,6 +249,30 @@ def start_transfer(state: GameState, action: Transfer, actor: str | None = None)
     return op
 
 
+# ======================= 작전지시 (진행 중 작전 제어: 회군·전략변경) =======================
+def apply_op_command(state: GameState, action: OpCommand, actor: str | None = None) -> None:
+    """진행 중 작전에 지시. 회군=즉시 복귀(교전 중=퇴각 손실) → 같은 턴 뒤 명령으로 재출격 가능(=작전 변경).
+    전략변경=전략문 교체(judge 배선 시 교전 보정 입력). 남의 작전=기각."""
+    op = next((o for o in state.operations if o.id == action.op_id), None)
+    if op is None:
+        state.history.append(f"[기각] 작전지시 대상 작전{action.op_id} 없음")
+        return
+    if actor is not None and op.faction != actor:
+        state.history.append(f"[위반] {actor}가 남의 작전{op.id}({op.faction})에 지시 시도 → 기각")
+        return
+    if action.order == "회군":
+        fighting = op.stage == "교전" or op.id in _field_engaged_ids(state)
+        if fighting:                                  # 싸우다 빠지는 건 공짜가 아님(강제 퇴각과 동일 손실)
+            op.committed_troops -= round(op.committed_troops * FIELD_RETREAT_LOSS)
+        _return_home(state, op, "회군" + ("(교전 이탈, 퇴각 손실)" if fighting else " 명령"))
+    else:                                             # 전략변경
+        if not hasattr(op.action, "strategy"):
+            state.history.append(f"[기각] 작전{op.id}({op.action.mode})은 전략을 갖지 않음")
+            return
+        op.action.strategy = action.strategy
+        state.history.append(f"[지시] 작전{op.id} 전략 갱신: {action.strategy}")
+
+
 # ======================= 이동 (마일스톤=암묵적, progress로 파생) =======================
 def _advance_movement(state: GameState) -> None:
     """이동중 작전 진행. 필드 교전 중(고정)이거나 야전 교전 마친(has_fought) op는 안 움직임.
@@ -323,6 +347,9 @@ def _siege_round(state: GameState, op: ActiveOperation) -> None:
     op.unit_morale = max(0, op.unit_morale - UNIT_MORALE_COMBAT_DROP)
     city.troops -= def_loss
     op.progress += max(0, round(dominance * SIEGE_RATE))
+    state.history.append(                             # 라운드 가시화(F층 관측성·관전): 무음 공성 해소
+        f"[작전{op.id}] {op.faction} {city.name} 공성 중 "
+        f"(진행 {op.progress:g}/{op.threshold:g}, 병력 {op.committed_troops} vs 수비 {city.troops})")
     if op.committed_troops > 0 and (city.troops <= 0 or op.progress >= op.threshold):
         _capture_city(state, op, city)
 
@@ -607,6 +634,8 @@ def _dispatch(state: GameState, action, actor: str | None = None) -> None:
         start_operation(state, action, actor)        # 공성·야전 모두 진군 작전으로 개시
     elif isinstance(action, Transfer):
         start_transfer(state, action, actor)
+    elif isinstance(action, OpCommand):
+        apply_op_command(state, action, actor)
     elif isinstance(action, Scheme):
         state.history.append(f"[증분2] 계략({action.scheme_type}) 미구현 → 무시")
 

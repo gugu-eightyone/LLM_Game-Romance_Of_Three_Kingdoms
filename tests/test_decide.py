@@ -28,7 +28,7 @@ def test_brief_shows_own_adjacency_and_enemy():
     text = brief(s, "촉")
     assert "우리=촉" in text
     assert "성도(촉)" in text and "업(위)" in text        # 양쪽 다 보인다(난이도 보통=전 정보)
-    assert "인접: 업(위 1개월)" in text                    # 출병 가능 목적지가 명시된다
+    assert "인접: 업(위 1개월·공성/야전)" in text          # 출병 가능 목적지 + 가능 동사 태깅 명시
     assert "금5000" in text                                # 우리 도시만 금·식량 노출
     assert "금4000" not in text                            # 적 도시 금은 안 실림(토큰 절약)
 

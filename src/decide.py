@@ -28,12 +28,18 @@ SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 주어진 정세�
 - 명령은 적힌 순서대로 즉시 처리된다(예: 모병을 먼저 적으면 그 병력으로 같은 달 출격 가능).
 - 전투는 반드시 **우리 도시**에서 출발하고, 목표는 그 도시의 **인접 목록에 있는 도시**여야 한다.
 - 투입 병력은 출발 도시의 보유 병력 이내. 동행 장수는 그 도시에 주둔한 장수만.
-- mode 공성 = **다른 세력의** 인접 도시를 점령한다(우리 도시는 공성 대상이 아니다). mode 야전 = 적 방면으로 출격해 진군 중인 적 부대를 길목에서
-  요격한다(거리 2개월 이상인 도로에서만 마주친다).
+- mode 공성 = **다른 세력의** 인접 도시를 점령한다. 목표는 인접 목록에 **「공성/야전」으로 표시된 도시만**(아군 도시 공성=기각).
+- mode 야전 = 도로로 출격해 적 부대와 싸운다. 목표가 **적 도시면 그 방면 요격**, **아군 도시면 구원 출격**(그 성을
+  치러 오는 적을 막는다). 거리 2개월 이상인 도로에서만 마주친다.
+- **우리 도시가 공격받고 있으면** 그 도시 방면 야전(구원) 또는 호송(병력 증원)으로 대응하라. 공성으로는 지원할 수 없다.
 - 호송(kind=호송) = 병사·장수·포로·금·식량을 **인접한 우리 도시**로 보낸다. 병사·물자·포로를 실으면
   호위 병사 200 이상 동원. 장수만 보낼 땐 병사 0도 된다.
 - 내정은 우리 도시에 금을 투입한다. 식량증산·모병(금 1 → 2), 성벽보수, 사기진작.
-- 이미 진행 중인 작전은 저절로 계속된다. 같은 작전을 다시 명령하지 마라(병력만 낭비된다).
+- 작전지시(kind=작전지시) = **진행 중인 우리 작전**([진행 중 작전]의 번호로 지정)에 지시한다.
+  order 전략변경 = 새 strategy를 내려 전술을 갱신한다(전황이 바뀌면 적극 활용하라).
+  order 회군 = 부대를 철수시킨다(교전 중 회군은 퇴각 손실). 회군한 병력은 같은 달 새 출격에 쓸 수 있다.
+- 이미 진행 중인 작전은 저절로 계속된다. 같은 작전을 다시 출격 명령하지 마라(병력만 낭비된다).
+  출발 도시에 남은 병력이 있을 때만 추가 출병이 가능하다(병0 = 출병 불가).
 - 계략(kind=계략)은 아직 미구현이니 절대 고르지 마라.
 - strategy는 50자 이내 한국어 한 줄.
 
@@ -42,7 +48,8 @@ SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 주어진 정세�
 
 def _city_line(state: GameState, name: str, own: bool) -> str:
     c = state.cities[name]
-    parts = [f"병{c.troops}", f"벽{c.wall}"]
+    # 병0 도시는 "출병 불가"를 글자로 박음(잔여 병력 대조를 mini에게 추론시키지 않기)
+    parts = [f"병{c.troops}" + ("(출병 불가)" if own and c.troops <= 0 else ""), f"벽{c.wall}"]
     if own:
         parts += [f"식{c.food}", f"금{c.gold}"]
     if c.generals:
@@ -52,7 +59,10 @@ def _city_line(state: GameState, name: str, own: bool) -> str:
         parts.append("포로 " + ",".join(c.prisoners))
     line = f"- {c.name}({c.owner}) " + "·".join(parts)
     if own:  # 인접은 우리 도시에만 붙인다 — 출병 가능한 목적지가 곧 이것이라(토큰 절약)
-        adj = [f"{n}({state.cities[n].owner} {d}개월)"
+        # 도시별 "쓸 수 있는 동사"를 명시 태깅: 소유 대조를 LLM이 추론하게 두지 않는다(자국 공성 환각 대책).
+        # 아군 방면도 구원야전은 정당(엔진 허용)이라 호송만 적으면 그 길이 가려짐 → 동사 목록으로.
+        adj = [f"{n}(아군 {d}개월·호송/구원야전)" if state.cities[n].owner == c.owner
+               else f"{n}({state.cities[n].owner} {d}개월·공성/야전)"
                for n, d in state.distances.get(name, {}).items() if n in state.cities]
         line += " | 인접: " + ", ".join(adj)
     return line
@@ -72,6 +82,7 @@ def brief(state: GameState, faction: FactionName) -> str:
         lines.append("[진행 중 작전]")
         lines += [f"- [{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"
                   f" {o.stage} {o.progress:g}/{o.threshold:g} 병력{o.committed_troops} 사기{o.unit_morale}"
+                  + (" ← 아군: 자동 계속(재출병 불필요, 작전지시만 가능)" if o.faction == faction else "")
                   for o in state.operations]
     if state.history:
         lines += ["[최근 전황]", *[f"- {h}" for h in state.history[-8:]]]

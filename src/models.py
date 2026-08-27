@@ -129,6 +129,18 @@ class Domestic(BaseModel):
     strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)  # 표현만 자연어(효과는 item+gold 결정론). 심판 채점 재료.
 
 
+class OpCommand(BaseModel):
+    """작전지시: 진행 중인 자기 작전에 지시. 회군=철수(교전 중=퇴각 손실), 전략변경=전략문 교체.
+
+    전략변경이 "전술 업그레이드해가며 싸우는 재미"의 인터페이스 — judge 배선 시 매 교전 라운드
+    이 전략을 채점해 전투 보정(±STRATEGY_MODIFIER_BOUND)으로 실효 발생. [[DISCUSSION#9-12]]
+    """
+    kind: Literal["작전지시"]
+    op_id: int                                   # 대상 작전 번호(brief [진행 중 작전]에 노출)
+    order: Literal["전략변경", "회군"]
+    strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)  # 전략변경일 때 새 전략문
+
+
 class Transfer(BaseModel):
     """호송: 병사·장수·포로·금·식량을 인접 아군 도시로 이동. 도착·요격 해소는 엔진.
 
@@ -149,7 +161,7 @@ class Transfer(BaseModel):
 # pydantic이 `oneOf`를 내고 → OpenAI 구조화출력이 이를 거부(anyOf만 허용, 스모크로 확인).
 # 세 변형의 `kind` 리터럴이 서로 겹치지 않아 discriminator 없는 평범한 Union으로도
 # 판별이 정확·유일함(잘못된 조합은 그대로 거부). → anyOf로 나가 OpenAI 통과.
-Action = Union[Battle, Scheme, Domestic, Transfer]
+Action = Union[Battle, Scheme, Domestic, Transfer, OpCommand]
 ActionAdapter = TypeAdapter(Action)              # dict → 올바른 변형으로 파싱·검증
 
 
