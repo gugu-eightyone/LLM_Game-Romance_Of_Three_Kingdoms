@@ -8,6 +8,9 @@ Q4 결정: 플레이어 모드 = "그 세력 결정 함수만 사람으로 교�
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import streamlit as st
 from pydantic import BaseModel, Field
 
@@ -33,17 +36,45 @@ class Narration(BaseModel):
 
 
 # ======================= 세션 헬퍼 =======================
+SAVE_DIR = Path(__file__).parent / "saves"
+
+
 def S() -> GameState:
     return st.session_state.state
+
+
+def _boot(state: GameState, player: str | None, narrate: bool) -> None:
+    """새 게임·로드 공용 세션 초기화(휘발 상태 전부 리셋 — 저장은 턴 경계라 잃을 게 없음)."""
+    st.session_state.update(state=state, player=player, narrate=narrate,
+                            orders=[], parley_used=0, events=[], retorts=[],
+                            narration=None, over=None, mode="play", parley=None)
 
 
 def new_game(player: str | None, seed: int, narrate: bool) -> None:
     s = load_scenario()
     s.seed = seed
     s._rng = None                                     # 시드 반영해 RNG 재생성
-    st.session_state.update(state=s, player=player, narrate=narrate,
-                            orders=[], parley_used=0, events=[], retorts=[],
-                            narration=None, over=None, mode="play", parley=None)
+    _boot(s, player, narrate)
+
+
+def save_game() -> Path:
+    """턴 경계(명령 작성 화면)에서만 호출 — GameState + 세력/설정이면 판 전체가 복원된다.
+
+    같은 (세력, 게임 날짜)면 덮어씀(퀵세이브 semantics). RNG 진행 위치는 저장 안 됨
+    (시드로 재생성 — 플레이 무해, D층 완전 재현 필요해지면 getstate 동반 직렬화로 승격).
+    """
+    SAVE_DIR.mkdir(exist_ok=True)
+    s = S()
+    path = SAVE_DIR / f"{st.session_state.player or '관전'}_{s.year}년{s.month:02d}월.json"
+    payload = {"player": st.session_state.player, "narrate": st.session_state.narrate,
+               "state": s.model_dump(mode="json")}
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def load_game(path: Path) -> None:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    _boot(GameState.model_validate(payload["state"]), payload["player"], payload["narrate"])
 
 
 def orders_left() -> int:
@@ -91,6 +122,14 @@ def setup_screen() -> None:
     if st.button("게임 시작", type="primary"):
         new_game(None if who.startswith("관전") else who, int(seed), narrate)
         st.rerun()
+    saves = sorted(SAVE_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime,
+                   reverse=True) if SAVE_DIR.exists() else []
+    if saves:
+        st.divider()
+        pick = st.selectbox("세이브 불러오기", saves, format_func=lambda p: p.stem)
+        if st.button("이어하기"):
+            load_game(pick)
+            st.rerun()
 
 
 # ======================= 화면: 정세 =======================
@@ -406,6 +445,9 @@ with st.sidebar:
     if st.session_state.mode != "setup":
         who = st.session_state.player or "관전"
         st.caption(f"모드: {who} · 시드 {S().seed}")
+        if st.session_state.mode == "play" and not st.session_state.over:
+            if st.button("💾 저장"):                   # 턴 경계에서만(작성 중 명령 등 휘발 상태 없음)
+                st.toast(f"저장됨: {save_game().stem}")
         if st.button("처음부터"):
             st.session_state.mode = "setup"
             st.rerun()
