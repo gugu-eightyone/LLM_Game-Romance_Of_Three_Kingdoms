@@ -179,6 +179,17 @@ def test_resolve_dispositions_imprison_means_no_requery(monkeypatch):
     assert "감녕" in s.cities["수춘"].prisoners and not s.pending_captives
 
 
+def test_resolve_dispositions_skips_player_faction(monkeypatch):
+    """플레이어 세력의 포획자는 LLM에 안 묻고 큐에 잔존 → 턴 종료 결과 창이 소비(Q4 동형)."""
+    import src.decide as decide
+    monkeypatch.setattr(decide, "structured_complete",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("플레이어 몫에 LLM 호출 금지")))
+    s = _state()
+    s.pending_captives.append(("수춘", "감녕"))
+    decide.resolve_dispositions(s, player="위")
+    assert s.pending_captives == [("수춘", "감녕")]    # UI가 소비할 때까지 유지
+
+
 def test_resolve_dispositions_holds_on_llm_failure(monkeypatch):
     import src.decide as decide
     from src.llm import LLMError

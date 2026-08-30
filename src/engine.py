@@ -23,8 +23,10 @@ from .models import (
 from .config import (
     ATTRITION_RATE, CAPTURE_FLOOR, DEFAULT_SPEED, DOMESTIC_GAIN, ESCORT_MIN_TROOPS,
     FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
-    MAX_ORDERS_PER_TURN, MORALE_COMBAT_BAND, PERSUADE_BASE, PERSUADE_INTEL_SCALE,
-    PREP_CAP, PREP_RATE,
+    MAX_ORDERS_PER_TURN, MORALE_CITY_LOST, MORALE_CITY_TAKEN, MORALE_COMBAT_BAND,
+    MORALE_FEAST_CAP, MORALE_RULER_CAPTURED,
+    PERSUADE_BASE, PERSUADE_INTEL_SCALE, PREP_CAP, PREP_RATE,
+    SURRENDER_CITY_WEIGHT, SURRENDER_DOMINANCE,
     RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE, SIEGE_RATE,
     SIEGE_RETREAT_SURVIVAL, SORTIE_SLOW_CAP, UNIT_MORALE_COMBAT_DROP,
     WALL_DEFENSE, WALL_MANNING,
@@ -97,6 +99,15 @@ def _combat_round(state: GameState, a: Force, b: Force) -> tuple[int, int, float
     b_loss = min(b.troops, round(ap * ATTRITION_RATE))
     dominance = (ap / bp - 1) if bp > 0 else 999.0
     return a_loss, b_loss, dominance
+
+
+def _shift_morale(state: GameState, faction: str, delta: int, why: str) -> None:
+    """전역 사기 이벤트 훅(§9-10 배선): 함락·상실·격퇴·군주 피랍이 사기를 움직인다. 클램프 0~100."""
+    f = state.factions.get(faction)
+    if f is None or delta == 0:
+        return
+    f.morale = max(0, min(100, f.morale + delta))
+    state.history.append(f"[사기] {faction} {delta:+d} ({why}) → {f.morale}")
 
 
 def allied(state: GameState, a: str, b: str) -> bool:
@@ -219,8 +230,10 @@ def apply_domestic(state: GameState, action: Domestic, actor: str | None = None)
         city.wall += max(1, spend // 3000)
     elif action.item == "사기진작":
         f = state.factions.get(city.owner)
-        if f:  # 사기는 하드 바운드 0~100 → 엔진에서 명시 클램프(모델 assign은 재검증 안 함)
-            f.morale = max(0, min(100, f.morale + spend // 500))
+        if f and f.morale < MORALE_FEAST_CAP:  # 만찬 천장(⭐금 도배 방지): 그 위 사기는 승리(함락)로만
+            f.morale = min(MORALE_FEAST_CAP, f.morale + spend // 500)
+        elif f:
+            state.history.append(f"[내정] {city.owner} 사기진작 무효 — 잔치로는 사기 {MORALE_FEAST_CAP} 이상 못 올림")
     state.history.append(f"[내정] {city.owner} {action.city} {action.item}(금 {spend})")
 
 
@@ -440,6 +453,8 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
         state.cities[escape_dests[0]].troops += survivors
         state.history.append(f"  ↳ 수비 잔병 {survivors} {escape_dests[0]}(으)로 퇴각")
     _chronicle(state, f"{winner}, {loser}의 {city.name} 함락")
+    _shift_morale(state, winner, MORALE_CITY_TAKEN, f"{city.name} 함락")
+    _shift_morale(state, loser, MORALE_CITY_LOST, f"{city.name} 상실")
     if op in state.operations:
         state.operations.remove(op)
 
@@ -552,6 +567,7 @@ def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int) -> None
         if n_field > 0:
             _destroy_field_op(state, op, n_field)    # 야전 전멸 → 장수 포획(base×부대수)·화물 노획
         elif op.action.mode != "호송":               # 장수 단독 호송(병력 0)은 정상 → 계속 간다
+            # 격퇴 사기 훅은 안 둠(⭐사기=세력 정신적 무장 → 국지 전투 승패는 제외, 함락/상실/피랍만)
             _return_home(state, op, "격퇴" if op.action.mode == "공성" else "무위", troops=False)
         return
     # 야전(출성·구원 포함)은 실제 교전한 턴만 fighting — 성 앞 대기 중인 예비 출성이 퇴각 판정에 안 걸리게.
@@ -645,7 +661,10 @@ def _take_prisoner(state: GameState, holding_city: str, g: str) -> bool:
     state.cities[holding_city].prisoners.append(g)
     state.pending_captives.append((holding_city, g))  # 즉결 처분 질의 대상(포획 시 1회)
     gen = state.generals.get(g)
-    return gen is not None and gen.is_ruler
+    if gen is not None and gen.is_ruler:
+        _shift_morale(state, gen.faction, MORALE_RULER_CAPTURED, f"군주 {g} 피랍")
+        return True
+    return False
 
 
 def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int) -> None:
@@ -781,7 +800,16 @@ def apply_persuade(state: GameState, action: Persuade, actor: str | None = None)
     attempt_persuade(state, action.city, action.prisoner, p)
 
 
-# ======================= 외교 (동맹·포로반환) [[DISCUSSION#9-22]] =======================
+# ======================= 외교 (동맹·포로반환·항복권유) [[DISCUSSION#9-22]] =======================
+def _faction_power(state: GameState, faction: str) -> int:
+    """항복 게이트용 국력 = 총병력(도시+출전 부대) + 도시수×가중치. LLM 관여 0."""
+    troops = sum(c.troops for c in state.cities.values() if c.owner == faction)
+    troops += sum(o.committed_troops for o in state.operations if o.faction == faction)
+    n_cities = sum(1 for c in state.cities.values() if c.owner == faction)
+    return troops + n_cities * SURRENDER_CITY_WEIGHT
+
+
+
 def apply_diplomacy(state: GameState, action: Diplomacy, actor: str | None = None) -> None:
     """외교 명령 처리(결정론 검증). 파기=즉시 효력, 동맹·포로반환=제안 큐(상대 군주 판단은 드라이버).
 
@@ -828,6 +856,19 @@ def apply_diplomacy(state: GameState, action: Diplomacy, actor: str | None = Non
             f"[외교] {me}, {t}에 {action.prisoner} 반환 요청(몸값 금{action.offer_gold}·식{action.offer_food})")
         return
 
+    if action.proposal == "항복권유":
+        # ⭐게이트=결정론(비등하면 확률 0이 아니라 제안 자체 불성립). 수락 여부만 상대 군주 판단.
+        if _faction_power(state, me) < SURRENDER_DOMINANCE * max(1, _faction_power(state, t)):
+            state.history.append(f"[기각] {me}의 {t} 항복 권유 — 대세가 그만큼 기울지 않음")
+            return
+        if any(p.proposal == "항복권유" and p.to_faction == t for p in state.proposals):
+            state.history.append(f"[기각] {t} 항복 권유 중복")
+            return
+        state.proposals.append(Proposal(from_faction=me, to_faction=t, proposal="항복권유",
+                                        envoy=envoy, message=action.message))
+        state.history.append(f"[외교] {me}, {t}에 항복 권유")
+        return
+
     # 동맹 제안
     if allied(state, me, t):
         state.history.append(f"[환각] {me}-{t} 이미 동맹인데 재제안 → 기각")
@@ -857,6 +898,33 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
         if pair not in state.alliances:
             state.alliances.append(pair)
             _chronicle(state, f"{pair[0]}-{pair[1]} 동맹 체결")
+        return True
+    if prop.proposal == "항복권유":                   # 수락 = b가 a에 항복(전 도시·군대·장수 헌납)
+        lf = state.factions.get(b)
+        if lf is None or not lf.alive:
+            state.history.append(f"[외교] {b} 항복 무산(세력 소멸)")
+            return False
+        for op2 in [o for o in state.operations if o.faction == b]:   # 출전 부대 해산 → 가까운 도시로 귀속
+            c = state.cities.get(op2.action.origin) or state.cities.get(op2.action.target)
+            if c is not None:
+                c.troops += max(0, op2.committed_troops)
+                c.generals.extend(op2.committed_generals)
+                c.prisoners.extend(op2.cargo_prisoners)
+                c.gold += op2.cargo_gold
+                c.food += op2.cargo_food
+            state.operations.remove(op2)
+        for c in state.cities.values():
+            if c.owner == b:
+                c.owner = a
+        for g in state.generals.values():
+            if g.faction == b:
+                g.faction = a
+                g.is_ruler = False                    # 항복 군주 = 승자의 신하(일개 장수)
+        lf.alive = False
+        state.alliances = [p for p in state.alliances if b not in p]
+        state.proposals = [p for p in state.proposals if b not in (p.from_faction, p.to_faction)]
+        _chronicle(state, f"{b}, {a}에 항복 (전 도시 헌납)")
+        check_victory(state)
         return True
     # 포로반환
     jail = next((c for c in state.cities.values()

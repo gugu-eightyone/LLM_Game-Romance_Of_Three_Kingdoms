@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from .config import STRATEGY_MAX_CHARS
 from .llm import LLMError, structured_complete
 from .models import Action, Domestic, FactionName, GameState
+from .prompts import load as load_prompt
 
 
 class Decision(BaseModel):
@@ -25,47 +26,8 @@ class Decision(BaseModel):
     actions: list[Action]                    # 1~4건. 상한 강제는 엔진(초과=[환각] 로깅, A층 표면)
 
 
-SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 주어진 정세를 읽고 이번 달 명령 목록(1~4건)을 정하라.
-
-규칙(어기면 그 명령은 기각된다):
-- 명령은 적힌 순서대로 즉시 처리된다(예: 모병을 먼저 적으면 그 병력으로 같은 달 출격 가능).
-- 전투는 반드시 **우리 도시**에서 출발하고, 목표는 그 도시의 **인접 목록에 있는 도시**여야 한다.
-- 출격 명령의 origin_troops_seen에는 **브리핑에 적힌 출발 도시의 현재 보유 병력을 그대로 베껴 적어라**
-  (투입량이 아니다). 투입 troops는 그 이하에서 자유.
-- 진행 중인 부대에 병력을 직접 보탤 수는 없다. **증원 = 같은 목표로 추가 출격**(도착하면 합류 협공이 된다).
-- 투입 병력은 출발 도시의 보유 병력 이내. 동행 장수는 그 도시에 주둔한 장수만.
-- mode 공성 = **다른 세력의** 인접 도시를 점령한다. 목표는 인접 목록에 **「공성/야전」으로 표시된 도시만**(아군 도시 공성=기각).
-- mode 야전 = 도로로 출격해 적 부대와 싸운다. 목표가 **적 도시면 그 방면 요격**, **아군 도시면 구원 출격** —
-  적이 있으면 싸우고, 적이 아직 없으면 **그 도시에 주둔(합류)해 수비를 강화**한다(=증원). 거리 2개월 이상인 도로에서만 마주친다.
-- **⚠피침 표시가 붙은 우리 도시**는 공격받는 중이다. 대응 4가지: ① 접근 중인 적을 길에서 요격 = **그 도시에서
-  적이 오는 방면(경보에 표시된 방면 도시)으로 야전 출격** ② 다른 도시에서 그 도시로 구원 야전(주둔) ③ 호송으로 증원
-  ④ 그 도시를 출발지이자 목표로 하는 야전 = **출성**(수비대 일부가 성 앞에 진 친다. 적이 도착하면 성벽 밖에서
-  먼저 싸워 공성 진행을 늦추고, 적이 물러가면 자동으로 성에 복귀한다. 출성 부대는 성벽 보너스가 없고,
-  병력을 너무 빼면 남은 수성이 약해진다). 공성으로는 지원할 수 없다.
-- **수성은 자동이다** — 주둔 병력은 명령 없이도 성벽 보너스를 받으며 그 도시를 지킨다(단 성벽은 남은 병력이
-  지키는 만큼만 위력을 낸다). 제자리 야전(출발지=목표)은 **⚠피침 도시에서만 출성**으로 성립하고 그 외엔
-  기각된다.
-- 호송(kind=호송) = 병사·장수·포로·금·식량을 **인접한 우리 도시**로 보낸다. 병사·물자·포로를 실으면
-  호위 병사 200 이상 동원. 장수만 보낼 땐 병사 0도 된다.
-- 내정은 우리 도시에 금을 투입한다. 식량증산·모병(금 1 → 2), 성벽보수, 사기진작.
-- 작전지시(kind=작전지시) = **진행 중인 우리 작전**([진행 중 작전]의 번호로 지정)에 지시한다.
-  order 전략변경 = 새 strategy를 내려 전술을 갱신한다(전황이 바뀌면 적극 활용하라).
-  order 회군 = 부대를 철수시킨다(교전 중 회군은 퇴각 손실). 회군한 병력은 같은 달 새 출격에 쓸 수 있다.
-- 이미 진행 중인 작전은 저절로 계속된다. 같은 작전을 다시 출격 명령하지 마라(병력만 낭비된다).
-  출발 도시에 남은 병력이 있을 때만 추가 출병이 가능하다(병0 = 출병 불가).
-- 설득(kind=설득) = **우리 도시에 수감된 포로**의 등용을 시도한다. persuader에 그 도시 주둔 우리 장수를
-  지정하라(그 장수의 지력이 성공 확률을 정한다. 군주 포로는 설득 불가). 실패해도 포로는 남는다(재시도 가능).
-- 외교(kind=외교) = proposal 동맹: 다른 세력에 동맹을 제안한다(message 한 줄 국서, envoy에 우리 장수를
-  사신으로 지정 가능). 상대 군주가 수락해야 성립한다. proposal 파기: **동맹 중일 때만**(브리핑에
-  「동맹=」 표시가 있을 때) 그 동맹을 깬다(즉시 효력 — 같은 달 이어지는 공격도 가능하나 배신은 기록에
-  남는다). proposal 포로반환: 적에게 잡힌 **우리 장수**를
-  몸값(offer_gold·offer_food)을 제시해 되사온다(prisoner에 장수 이름). 상대가 수락해야 성립.
-- 동맹 중인 세력의 도시는 공성할 수 없다(치려면 먼저 파기). 「동맹」 표시 도시가 공격받으면
-  야전(구원)으로 도울 수 있다.
-- 계략(kind=계략)은 아직 미구현이니 절대 고르지 마라.
-- strategy는 50자 이내 한국어 한 줄.
-
-승리 조건은 천하통일이다. 다만 무리한 원정보다 전선 유지·국력 축적이 나은 달도 있다."""
+# 프롬프트 원문은 prompts/*.txt (2026-08-30 이사 — "3개 이상" 트리거 충족. 버전=git 해시)
+SYSTEM = load_prompt("decide_system")
 
 
 def _city_line(state: GameState, name: str, own: bool) -> str:
@@ -153,14 +115,7 @@ class Disposition(BaseModel):
     reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
 
 
-DISPOSITION_SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 사로잡은 포로 한 명의 처분을 정하라.
-
-- 석방: 원 세력의 도시로 돌려보낸다(은혜를 베푸는 선택. 군주 포로를 풀어주면 군주로 복귀한다).
-- 처형: 목을 벤다(위협 제거, 그러나 원한이 연혁에 남는다. 군주를 베면 그 세력은 새 군주를 세운다).
-- 수감: 계속 가둬둔다 — 이후 달에 **명령(kind=설득)으로 등용을 시도**하거나, 상대가 몸값을 들고
-  반환 협상을 걸어올 수 있다.
-
-reason은 50자 이내 한국어 한 줄."""
+DISPOSITION_SYSTEM = load_prompt("disposition")
 
 
 def decide_disposition(state: GameState, city: str, prisoner: str) -> Disposition | None:
@@ -180,11 +135,12 @@ def decide_disposition(state: GameState, city: str, prisoner: str) -> Dispositio
         return None                                  # 보류: 상태 무변, 다음 턴 재질의
 
 
-def resolve_dispositions(state: GameState, verbose: bool = False) -> None:
+def resolve_dispositions(state: GameState, verbose: bool = False,
+                         player: FactionName | None = None) -> None:
     """턴 해소 직후 드라이버 훅: **신규 포획자만** 보유 세력 LLM에 즉결 질의(석방/처형/수감) → 엔진 적용.
 
     수감 선택 후엔 재질의 없음 — 이후는 설득 명령(kind=설득)·몸값 협상의 영역(⭐사용자 재설계).
-    플레이어 모드는 이 함수 대신 결과 창이 그 세력 포로를 처리(Q4 결정함수 교체와 동형).
+    player: 그 세력의 포획자는 LLM에 안 묻고 큐에 남김 → 턴 종료 결과 창이 처리(Q4 결정함수 교체와 동형).
     """
     from .engine import apply_disposition
 
@@ -195,6 +151,9 @@ def resolve_dispositions(state: GameState, verbose: bool = False) -> None:
             continue
         faction = c.owner
         if faction not in state.factions or not state.factions[faction].alive:
+            continue
+        if faction == player:                          # 플레이어 몫 → 결과 창이 소비하게 잔존
+            state.pending_captives.append((city, prisoner))
             continue
         d = decide_disposition(state, city, prisoner)
         if d is None:                                  # 호출 실패 → 다음 턴 재질의
@@ -212,20 +171,14 @@ class ProposalResponse(BaseModel):
     reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
 
 
-PROPOSAL_SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. {proposer}가 외교 제안을 보내왔다.
-정세와 [주요 연혁](특히 상대의 과거 동맹 파기·배신 기록)을 보고 이해득실로 수락 여부를 판단하라.
-
-- 동맹 제안: 수락하면 서로 공격할 수 없고, 서로의 도시를 구원 야전으로 도울 수 있다.
-  어느 쪽이든 언제든 파기할 수 있다(파기는 기록에 남는다).
-- 포로반환 요청: 수락하면 제시된 몸값(금·식량)을 받고 그 포로를 돌려보낸다.
-  포로의 가치(능력·설득 가능성)와 몸값을 저울질하라.
-
-reason은 50자 이내 한국어 한 줄."""
+PROPOSAL_SYSTEM = load_prompt("proposal_response")
 
 
 def decide_proposal_response(state: GameState, prop) -> ProposalResponse | None:
     """제안받은 세력 군주 LLM에 수락/거절 질의(소호출). 실패 시 None=보류(제안 잔존, 다음 턴 재질의)."""
     detail = (f"[제안] {prop.from_faction}의 동맹 제안" if prop.proposal == "동맹"
+              else f"[제안] {prop.from_faction}의 항복 권유 — 수락하면 우리의 전부를 넘기고 나라를 접는다"
+              if prop.proposal == "항복권유"
               else f"[제안] {prop.from_faction}의 포로 {prop.prisoner} 반환 요청"
                    f" — 몸값 금{prop.offer_gold}·식량{prop.offer_food}")
     if prop.envoy:
@@ -240,10 +193,12 @@ def decide_proposal_response(state: GameState, prop) -> ProposalResponse | None:
         return None
 
 
-def resolve_proposals(state: GameState, verbose: bool = False) -> None:
+def resolve_proposals(state: GameState, verbose: bool = False,
+                      player: FactionName | None = None) -> None:
     """턴 해소 직후 드라이버 훅: 대기 외교 제안을 상대 군주 LLM에 질의 → 엔진 적용.
 
-    플레이어가 받는 제안은 이 함수 대신 결과 창에서 직접 응답(Q4 결정함수 교체와 동형, Streamlit 때).
+    player: 그 세력이 받는 제안(항복 권유 포함)은 LLM에 안 묻고 큐에 남김 → 결과 창에서
+    직접 수락/거절(수락한 항복 권유 = 패배 엔딩. Q4 결정함수 교체와 동형, UI는 Streamlit 때).
     """
     from .engine import respond_proposal
 
@@ -251,6 +206,8 @@ def resolve_proposals(state: GameState, verbose: bool = False) -> None:
         target = state.factions.get(prop.to_faction)
         if target is None or not target.alive:        # 그 사이 멸망 → 제안 소멸
             state.proposals.remove(prop)
+            continue
+        if prop.to_faction == player:                 # 플레이어 몫 → 결과 창이 소비하게 잔존
             continue
         r = decide_proposal_response(state, prop)
         if r is None:

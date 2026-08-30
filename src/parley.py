@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from .config import PARLEY_MAX_ROUNDS, STRATEGY_MAX_CHARS
 from .llm import LLMError, structured_complete
 from .models import GameState
+from .prompts import load as load_prompt
 
 
 class ParleyReply(BaseModel):
@@ -28,10 +29,8 @@ class ParleyScore(BaseModel):
     reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
 
 
-PRISONER_SYSTEM = """당신은 삼국지의 장수 {prisoner}다(원 소속 {faction}). 지금 {captor}에 사로잡혀
-군주 앞에서 귀순을 권유받고 있다. 당신이 아는 {prisoner}의 성격·충의·과거로 역할극하라.{persona}
-{loyalty}
-답은 200자 이내 대사 한 마디."""
+# 프롬프트 원문은 prompts/*.txt (2026-08-30 이사)
+PRISONER_SYSTEM = load_prompt("prisoner_persona")
 
 
 def _loyalty_line(loyalty: int) -> str:
@@ -42,13 +41,7 @@ def _loyalty_line(loyalty: int) -> str:
         return "당신은 충의가 깊다. 여간한 설득으로는 마음이 열리지 않지만, 명분이 정말 옳다면 아주 조금 흔들릴 수 있다."
     return "쉽게 넘어가지 마라 — 상대의 말이 당신의 처지·명분에 실제로 와닿을 때만 마음이 흔들린다."
 
-JUDGE_SYSTEM = """당신은 설득 담화의 심판이다. {captor} 군주가 포로 {prisoner}(원 소속 {faction})를
-설득한 대화를 읽고, **이 담화가 '{prisoner}라는 인물'의 마음을 실제로 움직일지**를 1~5로 채점하라.
-{loyalty_note}{persona} 채점 기준은 일반적 언변이 아니라 이 인물이다 —
-그의 명분·처지·연혁을 정확히 찌른 담화만 높은 점수를 받는다.
-
-5=이 인물조차 크게 흔들린다 / 3=마음 한구석이 움직인다 / 1=이 인물에겐 전혀 안 먹힌다(무례·헛소리 포함).
-협박이나 사실과 다른 주장(연혁과 모순)은 감점. reason은 50자 이내 한 줄."""
+JUDGE_SYSTEM = load_prompt("parley_judge")
 
 
 def _fallen(state: GameState, g) -> bool:

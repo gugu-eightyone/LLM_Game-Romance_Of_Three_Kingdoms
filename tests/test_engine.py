@@ -153,10 +153,14 @@ def test_domestic_wall_and_overspend_clamp():
 
 
 def test_morale_hard_clamp_at_100():
+    """0~100 하드 바운드는 이벤트 훅(_shift_morale)이 강제. 잔치는 천장(FEAST_CAP)까지만 — test_morale.py."""
+    from src.engine import _shift_morale
     s = _mini_state()
     s.factions["촉"].morale = 98
-    apply_domestic(s, Domestic(kind="내정", city="성도", item="사기진작", gold_spent=5000))
-    assert s.factions["촉"].morale == 100               # 사기 0~100 하드 바운드
+    _shift_morale(s, "촉", +20, "테스트")               # 함락 연승 가정
+    assert s.factions["촉"].morale == 100
+    _shift_morale(s, "촉", -999, "테스트")
+    assert s.factions["촉"].morale == 0
 
 
 def test_combat_round_wall_helps_defender():

@@ -165,6 +165,38 @@ def test_imprison_disposition_keeps_prisoner():
     assert "조운" in s.cities["건업"].prisoners
 
 
+# ---------- 항복 권유 ----------
+def test_surrender_gate_rejects_when_even():
+    """⭐비등하면 확률 0이 아니라 제안 자체가 결정론 기각(게이트)."""
+    s = _state()
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="항복권유"), actor="촉")
+    assert not s.proposals and any("기울지 않음" in h for h in s.history)
+
+
+def test_surrender_accept_transfers_everything():
+    s = _state()
+    s.cities["건업"].troops = 1000                     # 위 국력 25000 ≥ 3 × 오 6000
+    s.generals["손권"] = General(name="손권", is_ruler=True, faction="오")
+    s.cities["건업"].generals.append("손권")
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="항복권유",
+                                 message="천명은 위에 있다"), actor="위")
+    assert len(s.proposals) == 1
+    assert respond_proposal(s, s.proposals[0], True) is True
+    assert s.cities["건업"].owner == "위" and not s.factions["오"].alive
+    assert s.generals["여몽"].faction == "위"
+    assert s.generals["손권"].faction == "위" and not s.generals["손권"].is_ruler   # 군주=신하로
+    assert any("항복" in c for c in s.chronicle)
+
+
+def test_surrender_reject_changes_nothing():
+    s = _state()
+    s.cities["건업"].troops = 1000
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="항복권유"), actor="위")
+    respond_proposal(s, s.proposals[0], False, "아직 강동의 혼은 죽지 않았다")
+    assert s.cities["건업"].owner == "오" and s.factions["오"].alive
+    assert any("거절" in h for h in s.history)
+
+
 # ---------- 멸망·드라이버 ----------
 def test_fallen_faction_alliances_and_proposals_dissolve():
     s = _state()
@@ -179,6 +211,17 @@ def test_fallen_faction_alliances_and_proposals_dissolve():
         advance_turn(s, [])
     assert not s.factions["오"].alive
     assert s.alliances == [] and s.proposals == []
+
+
+def test_resolve_proposals_skips_player_targeted(monkeypatch):
+    """플레이어가 받는 제안(항복 권유 포함)은 LLM 응답 없이 큐 잔존 → 결과 창에서 직접 수락/거절."""
+    import src.decide as decide
+    monkeypatch.setattr(decide, "structured_complete",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("플레이어 몫에 LLM 호출 금지")))
+    s = _state()
+    s.proposals.append(Proposal(from_faction="위", to_faction="오", proposal="항복권유"))
+    decide.resolve_proposals(s, player="오")
+    assert len(s.proposals) == 1 and s.factions["오"].alive
 
 
 def test_resolve_proposals_applies_and_holds(monkeypatch):

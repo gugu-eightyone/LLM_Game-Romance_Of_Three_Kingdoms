@@ -167,7 +167,7 @@ class Diplomacy(BaseModel):
     """
     kind: Literal["외교"]
     target_faction: FactionName
-    proposal: Literal["동맹", "파기", "포로반환"]
+    proposal: Literal["동맹", "파기", "포로반환", "항복권유"]
     prisoner: str = ""                           # 포로반환: 되사올 우리 장수
     offer_gold: int = 0                          # 포로반환 몸값(금)
     offer_food: int = 0                          # 포로반환 몸값(식량)
