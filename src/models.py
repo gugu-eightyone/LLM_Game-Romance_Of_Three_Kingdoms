@@ -85,7 +85,9 @@ class GameState(BaseModel):
     generals: dict[str, General] = Field(default_factory=dict)          # 장수+군주 로스터(통솔·무력·지력·is_ruler). 위치=주둔 도시의 generals 리스트
     # --- 진행/결과 ---
     next_op_id: int = 1                          # 작전 id 발급 카운터
-    order_debits: dict[str, int] = Field(default_factory=dict)  # 세력별 다음 턴 명령 상한 차감(설득 시도 대가). advance_turn이 소비. [[DISCUSSION#9-21]]
+    alliances: list[tuple[str, str]] = Field(default_factory=list)  # 동맹 쌍(정렬 튜플로 정규화). 효과=안 싸움+구원, 파기 즉시. [[DISCUSSION#9-22]]
+    pending_captives: list[tuple[str, str]] = Field(default_factory=list)  # 신규 포획 (도시, 장수) — 즉결 처분 질의는 포획 시 1회만(수감 후엔 설득 명령·몸값 영역)
+    proposals: list[Proposal] = Field(default_factory=list)         # 대기 외교 제안 큐(턴 해소 후 상대 군주 질의로 소진)
     winner: FactionName | None = None            # 승리 판정 결과(None=진행 중)
     history: list[str] = Field(default_factory=list)
     chronicle: list[str] = Field(default_factory=list)  # 주요 연혁(함락·군주 포획/승계·처형·멸망). 영구 보존, brief 전량 노출 → "장비의 원수"를 LLM이 기억. 요약 LLM 불필요.
@@ -146,6 +148,45 @@ class OpCommand(BaseModel):
     strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)  # 전략변경일 때 새 전략문
 
 
+class Persuade(BaseModel):
+    """설득: 우리 도시에 수감된 포로의 등용 시도 — 행동 턴의 명령(⭐즉결 처분에서 분리, 명령 슬롯 자연 소모).
+
+    확률 = engine.persuade_chance(지정 persuader의 지력 × 포로 충의 감쇄). 실패해도 포로 잔존.
+    """
+    kind: Literal["설득"]
+    city: str                                    # 포로가 수감된 우리 도시
+    prisoner: str
+    persuader: str = ""                          # 담화를 맡을 그 도시 주둔 우리 장수(지력이 확률)
+    strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
+
+
+class Diplomacy(BaseModel):
+    """외교: 동맹 제안/파기/포로반환. 수락 판정=상대 군주 LLM(즉결 질의), 효과·검증=엔진. [[DISCUSSION#9-22]]
+
+    파기는 즉시 효력(같은 턴 "파기→공격" 배신 콤보 성립 — 기록이 연혁에 남아 신뢰는 LLM이 판단).
+    """
+    kind: Literal["외교"]
+    target_faction: FactionName
+    proposal: Literal["동맹", "파기", "포로반환"]
+    prisoner: str = ""                           # 포로반환: 되사올 우리 장수
+    offer_gold: int = 0                          # 포로반환 몸값(금)
+    offer_food: int = 0                          # 포로반환 몸값(식량)
+    envoy: str = ""                              # 사신 장수(지정만 — 서사·C층 재료, 기계 효과 없음)
+    message: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
+
+
+class Proposal(BaseModel):
+    """대기 중 외교 제안(동맹/포로반환). 턴 해소 후 드라이버가 상대 군주 LLM에 질의해 해소. [[DISCUSSION#9-22]]"""
+    from_faction: str
+    to_faction: str
+    proposal: str = "동맹"
+    prisoner: str = ""
+    offer_gold: int = 0
+    offer_food: int = 0
+    envoy: str = ""
+    message: str = ""
+
+
 class Transfer(BaseModel):
     """호송: 병사·장수·포로·금·식량을 인접 아군 도시로 이동. 도착·요격 해소는 엔진.
 
@@ -166,7 +207,7 @@ class Transfer(BaseModel):
 # pydantic이 `oneOf`를 내고 → OpenAI 구조화출력이 이를 거부(anyOf만 허용, 스모크로 확인).
 # 세 변형의 `kind` 리터럴이 서로 겹치지 않아 discriminator 없는 평범한 Union으로도
 # 판별이 정확·유일함(잘못된 조합은 그대로 거부). → anyOf로 나가 OpenAI 통과.
-Action = Union[Battle, Scheme, Domestic, Transfer, OpCommand]
+Action = Union[Battle, Scheme, Domestic, Transfer, OpCommand, Diplomacy, Persuade]
 ActionAdapter = TypeAdapter(Action)              # dict → 올바른 변형으로 파싱·검증
 
 

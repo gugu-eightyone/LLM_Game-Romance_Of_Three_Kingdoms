@@ -1,11 +1,11 @@
-"""담화(포로 즉결 처분) 테스트 — 확률식·처분 효과·명령 차감·전 군주 낙인·담화 루프. 전부 오프라인."""
+"""담화(포로 처분·설득 명령) 테스트 — 확률식·즉결 처분·설득=행동 턴 명령·담화 루프. 전부 오프라인."""
 import pytest
 
-from src.config import MAX_ORDERS_PER_TURN, PERSUADE_BASE
+from src.config import PERSUADE_BASE
 from src.engine import (
     apply_disposition, pending_dispositions, persuade_chance, _take_prisoner, advance_turn,
 )
-from src.models import City, Domestic, Faction, GameState, General
+from src.models import City, Faction, GameState, General, Persuade
 
 
 def _state(seed: int = 0) -> GameState:
@@ -55,7 +55,7 @@ def test_fallen_ruler_becomes_persuadable():
     s.cities["건업"].owner = "위"
     s.factions["오"].alive = False                     # 오 멸망
     assert persuade_chance(s, "수춘", "손권", "순욱") == pytest.approx(PERSUADE_BASE + 95 / 300)
-    assert apply_disposition(s, "수춘", "손권", "설득", persuader="순욱") is True
+    advance_turn(s, {"위": [Persuade(kind="설득", city="수춘", prisoner="손권", persuader="순욱")]})
     assert s.generals["손권"].faction == "위" and not s.generals["손권"].is_ruler
 
 
@@ -124,59 +124,59 @@ def test_release_without_home_goes_to_wilderness():
     assert any("재야" in c for c in s.chronicle)
 
 
-def test_persuade_success_recruits_and_debits():
-    s = _state(seed=1)                                 # Random(1) 첫 난수 ≈0.134 < p≈0.517
-    assert apply_disposition(s, "수춘", "감녕", "설득", persuader="순욱") is True
+def test_persuade_action_recruits():
+    """⭐설득 = 행동 턴의 명령(즉결 처분에서 분리) — 명령 슬롯을 자연 소모."""
+    s = _state(seed=1)                                 # Random(1) 첫 난수 ≈0.134 < p≈0.258
+    advance_turn(s, {"위": [Persuade(kind="설득", city="수춘", prisoner="감녕", persuader="순욱")]})
     assert "감녕" in s.cities["수춘"].generals and s.generals["감녕"].faction == "위"
     assert any("귀순" in c for c in s.chronicle)
-    assert s.order_debits["위"] == 1                   # 성패 무관 차감
 
 
-def test_persuade_failure_keeps_prisoner_and_debits():
+def test_persuade_action_failure_keeps_prisoner():
     s = _state(seed=0)                                 # Random(0) 첫 난수 ≈0.844 > p
-    assert apply_disposition(s, "수춘", "감녕", "설득", persuader="순욱") is False
-    assert "감녕" in s.cities["수춘"].prisoners        # 잔존 → 다음 턴 재질의
-    assert s.order_debits["위"] == 1
+    advance_turn(s, {"위": [Persuade(kind="설득", city="수춘", prisoner="감녕", persuader="순욱")]})
+    assert "감녕" in s.cities["수춘"].prisoners        # 잔존 → 재시도 가능
     assert pending_dispositions(s) == [("수춘", "감녕")]
 
 
-def test_persuade_impossible_pick_is_hallucination_no_debit():
+def test_persuade_action_guards():
     s = _state()
-    assert apply_disposition(s, "수춘", "감녕", "설득", persuader="여몽") is False  # 무효 주체
-    assert "위" not in s.order_debits                  # 기각은 무료(환각 로그만)
+    advance_turn(s, {"위": [Persuade(kind="설득", city="수춘", prisoner="감녕", persuader="여몽")]})
+    assert "감녕" in s.cities["수춘"].prisoners        # 무효 주체(타지 장수) → 기각
     assert any("[환각]" in h for h in s.history)
+    s2 = _state()
+    advance_turn(s2, {"오": [Persuade(kind="설득", city="수춘", prisoner="감녕", persuader="순욱")]})
+    assert any("[위반]" in h and "월권" in h for h in s2.history)   # 남의 도시 포로 설득
 
 
 def test_persuade_ruler_pick_rejected():
     s = _state()
     s.generals["손권"] = General(name="손권", is_ruler=True, faction="오")
     _take_prisoner(s, "수춘", "손권")
-    assert apply_disposition(s, "수춘", "손권", "설득", persuader="순욱") is False  # 군주=설득 불가
-    assert "손권" in s.cities["수춘"].prisoners
-
-
-# ---------- 명령 상한 차감 ----------
-def test_order_debit_shrinks_next_turn_cap():
-    s = _state(seed=0)
-    apply_disposition(s, "수춘", "감녕", "설득", persuader="순욱")   # 실패 → 차감 1
-    orders = [Domestic(kind="내정", city="수춘", item="모병", gold_spent=100)
-              for _ in range(MAX_ORDERS_PER_TURN)]
-    before = s.cities["수춘"].troops
-    advance_turn(s, {"위": orders})
-    assert s.cities["수춘"].troops == before + 200 * (MAX_ORDERS_PER_TURN - 1)  # 1건 잘림
-    assert any("[담화]" in h and "차감" in h for h in s.history)
-    assert not any("[환각] 위 명령" in h for h in s.history)   # 차감 컷은 환각 아님
-    assert "위" not in s.order_debits                  # 차감분 소비 후 소멸
+    advance_turn(s, {"위": [Persuade(kind="설득", city="수춘", prisoner="손권", persuader="순욱")]})
+    assert "손권" in s.cities["수춘"].prisoners        # 현직 군주 = 설득 불가
 
 
 # ---------- 질의 드라이버(decide) ----------
-def test_resolve_dispositions_applies_llm_choice(monkeypatch):
+def test_resolve_dispositions_queries_new_captives_once(monkeypatch):
     import src.decide as decide
     monkeypatch.setattr(decide, "structured_complete",
                         lambda fmt, sys, usr, **kw: decide.Disposition(choice="처형", reason="본보기"))
     s = _state()
+    s.pending_captives.append(("수춘", "감녕"))        # 신규 포획만 질의 대상
     decide.resolve_dispositions(s)
-    assert "감녕" not in s.generals
+    assert "감녕" not in s.generals and not s.pending_captives
+
+
+def test_resolve_dispositions_imprison_means_no_requery(monkeypatch):
+    """수감 선택 → 질의 큐에서 빠짐(재질의 스팸 없음). 이후는 설득 명령·몸값의 영역."""
+    import src.decide as decide
+    monkeypatch.setattr(decide, "structured_complete",
+                        lambda fmt, sys, usr, **kw: decide.Disposition(choice="수감", reason="몸값을 기다린다"))
+    s = _state()
+    s.pending_captives.append(("수춘", "감녕"))
+    decide.resolve_dispositions(s)
+    assert "감녕" in s.cities["수춘"].prisoners and not s.pending_captives
 
 
 def test_resolve_dispositions_holds_on_llm_failure(monkeypatch):
@@ -187,8 +187,10 @@ def test_resolve_dispositions_holds_on_llm_failure(monkeypatch):
         raise LLMError("죽음")
     monkeypatch.setattr(decide, "structured_complete", boom)
     s = _state()
+    s.pending_captives.append(("수춘", "감녕"))
     decide.resolve_dispositions(s)
-    assert "감녕" in s.cities["수춘"].prisoners        # 보류=상태 무변
+    assert "감녕" in s.cities["수춘"].prisoners        # 상태 무변
+    assert s.pending_captives == [("수춘", "감녕")]    # 다음 턴 재질의
 
 
 # ---------- 플레이어 담화 루프(parley) ----------
@@ -211,7 +213,6 @@ def test_run_parley_headless(monkeypatch):
     s = _state(seed=1)                                 # 첫 난수 ≈0.134 < 0.6
     ok = parley.run_parley(s, "수춘", "감녕", player_lines=["오의 대세는 기울었소"], verbose=False)
     assert ok and "감녕" in s.cities["수춘"].generals
-    assert s.order_debits["위"] == 1                   # 플레이어 담화도 시도=차감
 
 
 def test_parley_prompts_carry_loyalty_and_persona(monkeypatch):

@@ -112,7 +112,7 @@ def run_parley(state: GameState, city: str, prisoner: str,
     player_lines가 있으면 그걸 소비(헤드리스·테스트), 없으면 input()(CLI).
     빈 줄 입력 = 담화 조기 종료(그때까지의 대화로 채점).
     """
-    from .engine import apply_disposition
+    from .engine import attempt_persuade
 
     g = state.generals.get(prisoner)
     if g is not None and g.is_ruler and not _fallen(state, g):   # 현직 군주만 불가 — 망국 군주는 설득 가능(⭐사용자)
@@ -136,7 +136,7 @@ def run_parley(state: GameState, city: str, prisoner: str,
     chance = score_to_chance(verdict.score)           # 인물 난이도는 채점에 내재 — 상한 후처리 없음
     if verbose:
         print(f"[심판] {verdict.score}/5 ({verdict.reason}) → 확률 {chance:.0%}")
-    ok = apply_disposition(state, city, prisoner, "설득", chance=chance)
+    ok = attempt_persuade(state, city, prisoner, chance)
     if verbose:
         print(f"[결과] {'귀순!' if ok else '설득 실패'}")
     return ok

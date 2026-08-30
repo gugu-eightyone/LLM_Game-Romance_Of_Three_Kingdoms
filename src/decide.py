@@ -53,6 +53,15 @@ SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 주어진 정세�
   order 회군 = 부대를 철수시킨다(교전 중 회군은 퇴각 손실). 회군한 병력은 같은 달 새 출격에 쓸 수 있다.
 - 이미 진행 중인 작전은 저절로 계속된다. 같은 작전을 다시 출격 명령하지 마라(병력만 낭비된다).
   출발 도시에 남은 병력이 있을 때만 추가 출병이 가능하다(병0 = 출병 불가).
+- 설득(kind=설득) = **우리 도시에 수감된 포로**의 등용을 시도한다. persuader에 그 도시 주둔 우리 장수를
+  지정하라(그 장수의 지력이 성공 확률을 정한다. 군주 포로는 설득 불가). 실패해도 포로는 남는다(재시도 가능).
+- 외교(kind=외교) = proposal 동맹: 다른 세력에 동맹을 제안한다(message 한 줄 국서, envoy에 우리 장수를
+  사신으로 지정 가능). 상대 군주가 수락해야 성립한다. proposal 파기: **동맹 중일 때만**(브리핑에
+  「동맹=」 표시가 있을 때) 그 동맹을 깬다(즉시 효력 — 같은 달 이어지는 공격도 가능하나 배신은 기록에
+  남는다). proposal 포로반환: 적에게 잡힌 **우리 장수**를
+  몸값(offer_gold·offer_food)을 제시해 되사온다(prisoner에 장수 이름). 상대가 수락해야 성립.
+- 동맹 중인 세력의 도시는 공성할 수 없다(치려면 먼저 파기). 「동맹」 표시 도시가 공격받으면
+  야전(구원)으로 도울 수 있다.
 - 계략(kind=계략)은 아직 미구현이니 절대 고르지 마라.
 - strategy는 50자 이내 한국어 한 줄.
 
@@ -63,9 +72,11 @@ def _city_line(state: GameState, name: str, own: bool) -> str:
     c = state.cities[name]
     # 병0 도시는 "출병 불가"를 글자로 박음(잔여 병력 대조를 mini에게 추론시키지 않기)
     parts = [f"병{c.troops}" + ("(출병 불가)" if own and c.troops <= 0 else ""), f"벽{c.wall}"]
+    friends = {x for pair in state.alliances if c.owner in pair for x in pair}  # 동맹은 위협 아님(§9-22)
     if own:  # 피침 경보: "내 도시가 공격받는 중"을 추론시키지 않고 결론으로 박음(전부 결정론)
         for t in state.operations:
-            if t.faction != c.owner and getattr(t.action, "target", None) == name \
+            if t.faction != c.owner and t.faction not in friends \
+                    and getattr(t.action, "target", None) == name \
                     and t.action.mode in ("공성", "야전"):
                 eta = ("성 앞 교전 중" if t.stage == "교전"
                        else f"{t.action.origin} 방면에서 약 {max(0.0, t.threshold - t.progress):g}개월 후 도착")
@@ -82,6 +93,7 @@ def _city_line(state: GameState, name: str, own: bool) -> str:
         # 도시별 "쓸 수 있는 동사"를 명시 태깅: 소유 대조를 LLM이 추론하게 두지 않는다(자국 공성 환각 대책).
         # 아군 방면도 구원야전은 정당(엔진 허용)이라 호송만 적으면 그 길이 가려짐 → 동사 목록으로.
         adj = [f"{n}(아군 {d}개월·호송/구원야전)" if state.cities[n].owner == c.owner
+               else f"{n}(동맹 {state.cities[n].owner} {d}개월·구원야전만)" if state.cities[n].owner in friends
                else f"{n}({state.cities[n].owner} {d}개월·공성/야전)"
                for n, d in state.distances.get(name, {}).items() if n in state.cities]
         line += " | 인접: " + ", ".join(adj)
@@ -94,8 +106,10 @@ def brief(state: GameState, faction: FactionName) -> str:
     mine = [n for n, c in state.cities.items() if c.owner == faction]
     other = [n for n, c in state.cities.items() if c.owner != faction]
     captive = any(f.ruler in c.prisoners for c in state.cities.values())   # 군주 피랍(승계 보류 중, §9-21)
+    allies = sorted({x for pair in state.alliances if faction in pair for x in pair} - {faction})
     lines = [f"[{state.year}년 {state.month}월] 우리={faction}, 군주={f.ruler}"
-             + ("(적에게 피랍!)" if captive else "") + f", 사기={f.morale}",
+             + ("(적에게 피랍!)" if captive else "") + f", 사기={f.morale}"
+             + (f", 동맹={','.join(allies)}" if allies else ""),
              "[우리 도시]", *[_city_line(state, n, True) for n in mine],
              "[타 세력 도시]", *[_city_line(state, n, False) for n in other]]
     if state.chronicle:                              # 주요 연혁 전량(굵직한 것만이라 짧음) — 원한·대세 기억용
@@ -134,35 +148,27 @@ def decide(state: GameState, faction: FactionName) -> list[Action] | None:
 
 # ======================= 담화: 포로 즉결 처분 질의 [[DISCUSSION#9-21]] =======================
 class Disposition(BaseModel):
-    """포로 처분 응답. 판정(확률·효과)은 엔진 몫, 여긴 선택만."""
-    choice: Literal["설득", "석방", "처형"]
-    persuader: str = ""                      # 설득일 때 담화를 맡을 그 도시 주둔 우리 장수(⭐지정 장수 지력이 확률)
+    """포로 즉결 처분 응답(석방/처형/수감 — 포로 상태 정리만). ⭐설득은 이후 턴의 명령(kind=설득)."""
+    choice: Literal["석방", "처형", "수감"]
     reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
 
 
 DISPOSITION_SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 사로잡은 포로 한 명의 처분을 정하라.
 
-- 설득: 등용을 시도한다. persuader에 **[설득 후보]에 적힌 우리 장수 한 명**을 지정하라(그 장수의 지력이
-  성공 확률을 정한다, 후보별 확률이 아래에 있다). 시도하면 성패 무관 **다음 달 명령 1건을 소모**한다.
-  실패해도 포로는 남아 다음 달 다시 처분할 수 있다. 후보가 없으면 설득은 고를 수 없다(군주·충의 명장 포함).
 - 석방: 원 세력의 도시로 돌려보낸다(은혜를 베푸는 선택. 군주 포로를 풀어주면 군주로 복귀한다).
 - 처형: 목을 벤다(위협 제거, 그러나 원한이 연혁에 남는다. 군주를 베면 그 세력은 새 군주를 세운다).
+- 수감: 계속 가둬둔다 — 이후 달에 **명령(kind=설득)으로 등용을 시도**하거나, 상대가 몸값을 들고
+  반환 협상을 걸어올 수 있다.
 
 reason은 50자 이내 한국어 한 줄."""
 
 
-def decide_disposition(state: GameState, city: str, prisoner: str,
-                       options: list[tuple[str, float]]) -> Disposition | None:
-    """보유 세력 LLM에 포로 처분 질의(소호출). 실패 시 None=보류(포로 유지, 다음 턴 재질의).
-
-    options: 드라이버가 engine.persuade_chance로 계산한 (설득 장수, 확률) 후보(단방향 유지).
-    """
+def decide_disposition(state: GameState, city: str, prisoner: str) -> Disposition | None:
+    """보유 세력 LLM에 포로 즉결 처분 질의(소호출). 실패 시 None=유예(수감 유지, 다음 턴 재질의)."""
     faction = state.cities[city].owner
     g = state.generals.get(prisoner)
     stat = f"통솔{g.command}·지력{g.intel}, 원 소속 {g.faction}" if g else "정보 없음"
     lines = [f"[포로] {prisoner} ({stat}) — {city}에 수감",
-             "[설득 후보] " + (", ".join(f"{name}(확률 {p:.0%})" for name, p in options)
-                              if options else "(없음 — 설득 불가)"),
              f"[우리 사정] 도시 {sum(1 for c in state.cities.values() if c.owner == faction)}개, "
              f"사기 {state.factions[faction].morale}"]
     if state.chronicle:
@@ -175,25 +181,84 @@ def decide_disposition(state: GameState, city: str, prisoner: str,
 
 
 def resolve_dispositions(state: GameState, verbose: bool = False) -> None:
-    """턴 해소 직후 드라이버 훅: 잔존 포로 전부 보유 세력 LLM에 질의 → 엔진 적용.
+    """턴 해소 직후 드라이버 훅: **신규 포획자만** 보유 세력 LLM에 즉결 질의(석방/처형/수감) → 엔진 적용.
 
-    플레이어 모드는 이 함수 대신 담화 화면(parley)이 그 세력 포로를 처리(Q4 결정함수 교체와 동형).
+    수감 선택 후엔 재질의 없음 — 이후는 설득 명령(kind=설득)·몸값 협상의 영역(⭐사용자 재설계).
+    플레이어 모드는 이 함수 대신 결과 창이 그 세력 포로를 처리(Q4 결정함수 교체와 동형).
     """
-    from .engine import apply_disposition, pending_dispositions, persuade_chance
+    from .engine import apply_disposition
 
-    for city, prisoner in pending_dispositions(state):
-        faction = state.cities[city].owner
+    pending, state.pending_captives = list(state.pending_captives), []
+    for city, prisoner in pending:
+        c = state.cities.get(city)
+        if c is None or prisoner not in c.prisoners:   # 그 사이 이동·소멸
+            continue
+        faction = c.owner
         if faction not in state.factions or not state.factions[faction].alive:
             continue
-        options = [(g, p) for g in state.cities[city].generals
-                   if (p := persuade_chance(state, city, prisoner, g)) > 0]
-        d = decide_disposition(state, city, prisoner, options)
-        if d is None:
+        d = decide_disposition(state, city, prisoner)
+        if d is None:                                  # 호출 실패 → 다음 턴 재질의
+            state.pending_captives.append((city, prisoner))
             continue
         if verbose:
-            print(f"  [담화] {faction} → {prisoner}: {d.choice}"
-                  + (f" (설득 장수 {d.persuader})" if d.choice == "설득" else "") + f" ({d.reason})")
-        apply_disposition(state, city, prisoner, d.choice, persuader=d.persuader)
+            print(f"  [담화] {faction} → {prisoner}: {d.choice} ({d.reason})")
+        apply_disposition(state, city, prisoner, d.choice)
+
+
+# ======================= 외교: 제안 응답 질의 [[DISCUSSION#9-22]] =======================
+class ProposalResponse(BaseModel):
+    """외교 제안에 대한 상대 군주의 판단. 수락/거절은 이해득실 판단이라 확률(RNG) 없음 — 효과는 엔진."""
+    accept: bool
+    reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
+
+
+PROPOSAL_SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. {proposer}가 외교 제안을 보내왔다.
+정세와 [주요 연혁](특히 상대의 과거 동맹 파기·배신 기록)을 보고 이해득실로 수락 여부를 판단하라.
+
+- 동맹 제안: 수락하면 서로 공격할 수 없고, 서로의 도시를 구원 야전으로 도울 수 있다.
+  어느 쪽이든 언제든 파기할 수 있다(파기는 기록에 남는다).
+- 포로반환 요청: 수락하면 제시된 몸값(금·식량)을 받고 그 포로를 돌려보낸다.
+  포로의 가치(능력·설득 가능성)와 몸값을 저울질하라.
+
+reason은 50자 이내 한국어 한 줄."""
+
+
+def decide_proposal_response(state: GameState, prop) -> ProposalResponse | None:
+    """제안받은 세력 군주 LLM에 수락/거절 질의(소호출). 실패 시 None=보류(제안 잔존, 다음 턴 재질의)."""
+    detail = (f"[제안] {prop.from_faction}의 동맹 제안" if prop.proposal == "동맹"
+              else f"[제안] {prop.from_faction}의 포로 {prop.prisoner} 반환 요청"
+                   f" — 몸값 금{prop.offer_gold}·식량{prop.offer_food}")
+    if prop.envoy:
+        detail += f" (사신 {prop.envoy})"
+    if prop.message:
+        detail += f"\n[국서] {prop.message}"
+    try:
+        return structured_complete(
+            ProposalResponse, PROPOSAL_SYSTEM.format(faction=prop.to_faction, proposer=prop.from_faction),
+            brief(state, prop.to_faction) + "\n\n" + detail)
+    except LLMError:
+        return None
+
+
+def resolve_proposals(state: GameState, verbose: bool = False) -> None:
+    """턴 해소 직후 드라이버 훅: 대기 외교 제안을 상대 군주 LLM에 질의 → 엔진 적용.
+
+    플레이어가 받는 제안은 이 함수 대신 결과 창에서 직접 응답(Q4 결정함수 교체와 동형, Streamlit 때).
+    """
+    from .engine import respond_proposal
+
+    for prop in list(state.proposals):
+        target = state.factions.get(prop.to_faction)
+        if target is None or not target.alive:        # 그 사이 멸망 → 제안 소멸
+            state.proposals.remove(prop)
+            continue
+        r = decide_proposal_response(state, prop)
+        if r is None:
+            continue
+        if verbose:
+            print(f"  [외교] {prop.to_faction} ← {prop.from_faction} {prop.proposal}: "
+                  f"{'수락' if r.accept else '거절'} ({r.reason})")
+        respond_proposal(state, prop, r.accept, r.reason)
 
 
 def decide_all(state: GameState) -> dict[FactionName, list[Action]]:
@@ -221,6 +286,7 @@ def demo(turns: int = 6) -> None:
                 print(f"  {f}: {a.model_dump_json(exclude_defaults=True)}")
         advance_turn(state, actions)
         resolve_dispositions(state, verbose=True)    # 포획 포로 즉결 처분(§9-21)
+        resolve_proposals(state, verbose=True)       # 외교 제안 응답(§9-22)
         print(f"[{state.year}년 {state.month}월 종료]")
         print("\n".join(state.history[h0:]) or "  (변화 없음)")
         if state.winner:
