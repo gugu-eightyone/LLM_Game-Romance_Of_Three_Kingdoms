@@ -675,10 +675,15 @@ def persuade_chance(state: GameState, city_name: str, prisoner: str, persuader: 
     city = state.cities.get(city_name)
     gen = state.generals.get(prisoner)
     agent = state.generals.get(persuader)
-    if (city is None or gen is None or agent is None or gen.is_ruler
-            or persuader not in city.generals):
+    if city is None or gen is None or agent is None or persuader not in city.generals:
         return 0.0
-    return (PERSUADE_BASE + agent.intel / PERSUADE_INTEL_SCALE) * (1 - gen.loyalty / 100)
+    base = PERSUADE_BASE + agent.intel / PERSUADE_INTEL_SCALE
+    lf = state.factions.get(gen.faction)
+    if lf is None or not lf.alive:                    # ⭐원 세력 멸망 = 지킬 주군이 없음 → 충의 감쇄 미적용, 군주도 설득 가능
+        return base
+    if gen.is_ruler:                                  # 현직 군주(세력 생존) = 설득 불가(세력 흡수 가드레일)
+        return 0.0
+    return base * (1 - gen.loyalty / 100)
 
 
 def apply_disposition(state: GameState, city_name: str, prisoner: str,
@@ -725,6 +730,7 @@ def apply_disposition(state: GameState, city_name: str, prisoner: str,
             city.prisoners.remove(prisoner)
             city.generals.append(prisoner)
             state.generals[prisoner].faction = owner
+            state.generals[prisoner].is_ruler = False  # 망국 군주 등용 시 군주 신분 소멸(일개 장수로)
             _chronicle(state, f"{prisoner}, {owner}에 귀순 (설득)")
             return True
         state.history.append(f"[담화] {owner}, {prisoner} 설득 실패 (확률 {p:.0%})")

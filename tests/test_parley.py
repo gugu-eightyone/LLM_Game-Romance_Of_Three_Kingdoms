@@ -39,6 +39,26 @@ def test_persuade_chance_uses_designated_persuader_and_loyalty():
         (PERSUADE_BASE + 95 / 300) * 0.02)
 
 
+def test_fallen_faction_removes_loyalty_shield():
+    """⭐원 세력 멸망(도시 0)이면 충의 감쇄 미적용 — 지킬 주군이 없다(사용자 확정)."""
+    s = _state()
+    s.generals["감녕"].loyalty = 98                    # 관우급 충의라도
+    s.factions["오"].alive = False                     # 오 멸망
+    assert persuade_chance(s, "수춘", "감녕", "순욱") == pytest.approx(PERSUADE_BASE + 95 / 300)
+
+
+def test_fallen_ruler_becomes_persuadable():
+    """⭐망국 군주는 설득 가능(사용자 확정) — 귀순 시 군주 신분 소멸."""
+    s = _state(seed=1)                                 # 첫 난수 ≈0.134 < 풀확률 ≈0.517
+    s.generals["손권"] = General(name="손권", is_ruler=True, faction="오", loyalty=95)
+    _take_prisoner(s, "수춘", "손권")
+    s.cities["건업"].owner = "위"
+    s.factions["오"].alive = False                     # 오 멸망
+    assert persuade_chance(s, "수춘", "손권", "순욱") == pytest.approx(PERSUADE_BASE + 95 / 300)
+    assert apply_disposition(s, "수춘", "손권", "설득", persuader="순욱") is True
+    assert s.generals["손권"].faction == "위" and not s.generals["손권"].is_ruler
+
+
 def test_persuade_chance_zero_without_agent_or_max_loyalty():
     s = _state()
     assert persuade_chance(s, "수춘", "감녕", "여몽") == 0.0   # 타지/미주둔 장수 지정
@@ -211,6 +231,25 @@ def test_parley_prompts_carry_loyalty_and_persona(monkeypatch):
     parley.run_parley(s, "수춘", "감녕", player_lines=["천하를 논하자"], verbose=False)
     assert "강철" in seen[parley.ParleyReply] and "강동의 맹장" in seen[parley.ParleyReply]
     assert "98/100" in seen[parley.ParleyScore] and "강동의 맹장" in seen[parley.ParleyScore]
+
+
+def test_parley_prompts_switch_to_fallen_mode(monkeypatch):
+    """원 세력 멸망 시 연기·심판 프롬프트가 '망국 장수' 모드로 전환(충의 방패 해제)."""
+    import src.parley as parley
+    seen = {}
+
+    def fake(fmt, sys, usr, **kw):
+        seen[fmt] = sys
+        if fmt is parley.ParleyReply:
+            return parley.ParleyReply(text="……")
+        return parley.ParleyScore(score=3)
+    monkeypatch.setattr(parley, "structured_complete", fake)
+    s = _state()
+    s.generals["감녕"].loyalty = 98
+    s.factions["오"].alive = False
+    parley.run_parley(s, "수춘", "감녕", player_lines=["천하를 논하자"], verbose=False)
+    assert "멸망" in seen[parley.ParleyReply] and "강철" not in seen[parley.ParleyReply]
+    assert "멸망" in seen[parley.ParleyScore] and "98/100" not in seen[parley.ParleyScore]
 
 
 def test_run_parley_refuses_ruler(monkeypatch):

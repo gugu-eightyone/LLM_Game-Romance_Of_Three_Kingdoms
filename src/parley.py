@@ -44,11 +44,17 @@ def _loyalty_line(loyalty: int) -> str:
 
 JUDGE_SYSTEM = """당신은 설득 담화의 심판이다. {captor} 군주가 포로 {prisoner}(원 소속 {faction})를
 설득한 대화를 읽고, **이 담화가 '{prisoner}라는 인물'의 마음을 실제로 움직일지**를 1~5로 채점하라.
-{prisoner}의 충의는 {loyalty}/100이다.{persona} 채점 기준은 일반적 언변이 아니라 이 인물이다 —
-충의가 높은 인물일수록 같은 논리도 낮게 받는다(그의 명분·처지·연혁을 정확히 찌른 담화만 높은 점수).
+{loyalty_note}{persona} 채점 기준은 일반적 언변이 아니라 이 인물이다 —
+그의 명분·처지·연혁을 정확히 찌른 담화만 높은 점수를 받는다.
 
 5=이 인물조차 크게 흔들린다 / 3=마음 한구석이 움직인다 / 1=이 인물에겐 전혀 안 먹힌다(무례·헛소리 포함).
 협박이나 사실과 다른 주장(연혁과 모순)은 감점. reason은 50자 이내 한 줄."""
+
+
+def _fallen(state: GameState, g) -> bool:
+    """⭐원 세력 멸망(도시 0) = 충의의 대상이 없음 → 충의 방패 해제(사용자 확정 2026-08-30)."""
+    f = state.factions.get(g.faction) if g else None
+    return f is None or not f.alive
 
 
 def _script(transcript: list[tuple[str, str]]) -> str:
@@ -59,10 +65,13 @@ def prisoner_reply(state: GameState, city: str, prisoner: str,
                    transcript: list[tuple[str, str]]) -> str:
     """포로 페르소나의 응답 한 마디. 호출 실패 시 무해한 침묵 대사(앱 안 죽음)."""
     g = state.generals.get(prisoner)
+    loyalty = ("당신이 섬기던 세력은 이미 멸망해 지킬 주군이 없다. 남은 것은 당신의 긍지와 앞날뿐 — "
+               "명분과 예우가 닿으면 마음이 움직일 수 있다."
+               if _fallen(state, g) else _loyalty_line(g.loyalty if g else 50))
     system = PRISONER_SYSTEM.format(prisoner=prisoner, faction=g.faction if g else "미상",
                                     captor=state.cities[city].owner,
                                     persona=f"\n당신의 사람됨: {g.persona}" if g and g.persona else "",
-                                    loyalty=_loyalty_line(g.loyalty if g else 50))
+                                    loyalty=loyalty)
     user = _script(transcript) or "(군주가 당신을 바라본다)"
     if state.chronicle:
         user = "[주요 연혁]\n" + "\n".join(f"- {c}" for c in state.chronicle) + "\n\n" + user
@@ -74,8 +83,13 @@ def judge_parley(state: GameState, city: str, prisoner: str,
                  transcript: list[tuple[str, str]]) -> ParleyScore:
     """담화 심판(특화 심판 1호). 실패 시 1점(공짜 성공 없음 — 안전 쪽으로 수렴)."""
     g = state.generals.get(prisoner)
+    note = (f"{prisoner}가 섬기던 세력은 이미 멸망했다 — 충의의 대상이 없으니 충의 감점 없이 "
+            f"명분·예우 중심으로 채점하라."
+            if _fallen(state, g) else
+            f"{prisoner}의 충의는 {g.loyalty if g else 50}/100이다. "
+            f"충의가 높은 인물일수록 같은 논리도 낮게 받는다.")
     system = JUDGE_SYSTEM.format(prisoner=prisoner, faction=g.faction if g else "미상",
-                                 captor=state.cities[city].owner, loyalty=g.loyalty if g else 50,
+                                 captor=state.cities[city].owner, loyalty_note=note,
                                  persona=f" ({g.persona})" if g and g.persona else "")
     user = _script(transcript)
     if state.chronicle:
@@ -101,7 +115,7 @@ def run_parley(state: GameState, city: str, prisoner: str,
     from .engine import apply_disposition
 
     g = state.generals.get(prisoner)
-    if g is not None and g.is_ruler:                  # 군주는 설득 대상 아님(석방/처형만, §9-21)
+    if g is not None and g.is_ruler and not _fallen(state, g):   # 현직 군주만 불가 — 망국 군주는 설득 가능(⭐사용자)
         if verbose:
             print(f"{prisoner}은(는) 일국의 군주 — 설득할 수 없다(석방/처형만).")
         return False
