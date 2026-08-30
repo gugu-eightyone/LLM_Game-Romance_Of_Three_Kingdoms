@@ -46,6 +46,8 @@ class General(BaseModel):
     intel: int = 50          # 지력 = 계략·정보(안개). 증분2 배선
     is_ruler: bool = False   # 군주 플래그. 포획 시 세력 자동 승계 트리거(멸망은 도시0일 때만). [[DISCUSSION#9-16]]
     faction: str = ""        # 소속 세력. 시나리오 로드 시 시작 주둔 도시 소유주로 파생(등용 시 갱신). 포로 해방 복귀지 판정용.
+    loyalty: int = Field(default=50, ge=0, le=100)  # 충의: LLM 경로 확률 감쇄 + 페르소나 연기·심판 채점의 근거(⭐cap 폐지). 군주 설득 불가는 is_ruler. [[DISCUSSION#9-21]]
+    persona: str = ""        # 큐레이트 한 줄(도원결의 등 기계적 일관성이 필요한 소수만). 나머지는 모델 내장지식이 페르소나(§9-7).
 
 
 class ActiveOperation(BaseModel):
@@ -83,6 +85,7 @@ class GameState(BaseModel):
     generals: dict[str, General] = Field(default_factory=dict)          # 장수+군주 로스터(통솔·무력·지력·is_ruler). 위치=주둔 도시의 generals 리스트
     # --- 진행/결과 ---
     next_op_id: int = 1                          # 작전 id 발급 카운터
+    order_debits: dict[str, int] = Field(default_factory=dict)  # 세력별 다음 턴 명령 상한 차감(설득 시도 대가). advance_turn이 소비. [[DISCUSSION#9-21]]
     winner: FactionName | None = None            # 승리 판정 결과(None=진행 중)
     history: list[str] = Field(default_factory=list)
     chronicle: list[str] = Field(default_factory=list)  # 주요 연혁(함락·군주 포획/승계·처형·멸망). 영구 보존, brief 전량 노출 → "장비의 원수"를 LLM이 기억. 요약 LLM 불필요.

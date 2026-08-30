@@ -20,7 +20,8 @@ from .models import ActiveOperation, Battle, Domestic, GameState, OpCommand, Sch
 from .config import (
     ATTRITION_RATE, CAPTURE_FLOOR, DEFAULT_SPEED, DOMESTIC_GAIN, ESCORT_MIN_TROOPS,
     FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
-    MAX_ORDERS_PER_TURN, MORALE_COMBAT_BAND, PREP_CAP, PREP_RATE,
+    MAX_ORDERS_PER_TURN, MORALE_COMBAT_BAND, PERSUADE_BASE, PERSUADE_INTEL_SCALE,
+    PERSUADE_ORDER_COST, PREP_CAP, PREP_RATE,
     RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE, SIEGE_RATE,
     SIEGE_RETREAT_SURVIVAL, SORTIE_SLOW_CAP, UNIT_MORALE_COMBAT_DROP,
     WALL_DEFENSE, WALL_MANNING,
@@ -425,18 +426,13 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
     if op in state.operations:
         state.operations.remove(op)
 
-    ruler_captured = False
     for g in defenders:                              # 장수별 탈출/포로 (seeded RNG)
         if escape_dests and state.rng.random() >= capture_prob:
             state.cities[escape_dests[0]].generals.append(g)
             state.history.append(f"  ↳ {g} {escape_dests[0]}(으)로 탈출")
         else:
-            city.prisoners.append(g)
             state.history.append(f"  ↳ {g} 포로 (포위도 {encircle:.2f})")
-            gen = state.generals.get(g)
-            if gen is not None and gen.is_ruler:
-                gen.is_ruler = False
-                ruler_captured = True
+            if _take_prisoner(state, city.name, g):   # 군주 포획: 승계는 처분 확정까지 보류(§9-21 정정)
                 _chronicle(state, f"{winner}, {loser} 군주 {g} 포획")
 
     lf = state.factions.get(loser)
@@ -447,8 +443,6 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
         lf.alive = False
         state.history.append(f"⚔ {loser} 멸망 (전 도시 상실)")
         _chronicle(state, f"{loser} 멸망")
-    elif ruler_captured:                             # 군주 포획인데 도시 잔존 → 자동 승계
-        _succeed_ruler(state, loser)
 
 
 def _succeed_ruler(state: GameState, faction: str) -> None:
@@ -624,13 +618,14 @@ def _retreat_op(state: GameState, op: ActiveOperation) -> None:
 
 
 def _take_prisoner(state: GameState, holding_city: str, g: str) -> bool:
-    """장수 g를 holding_city 수감. 군주면 is_ruler 해제 + True 반환(승계 트리거)."""
+    """장수 g를 holding_city 수감. 군주면 True 반환(연혁용).
+
+    ⭐승계는 여기서 하지 않는다(§9-21 정정): 포획=군주 신분 유지(보류),
+    처형 확정 때만 승계, 석방=군주 그대로 복귀. 설득 불가는 is_ruler 체크가 담당.
+    """
     state.cities[holding_city].prisoners.append(g)
     gen = state.generals.get(g)
-    if gen is not None and gen.is_ruler:
-        gen.is_ruler = False
-        return True
-    return False
+    return gen is not None and gen.is_ruler
 
 
 def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int) -> None:
@@ -638,11 +633,9 @@ def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int) -> No
     prob = min(1.0, FIELD_CAPTURE_BASE * n_field)
     jail = _nearest_enemy_city(state, op)
     home = _home_city(state, op)
-    ruler_lost = False
     for g in list(op.committed_generals):
         if jail and state.rng.random() < prob:
-            if _take_prisoner(state, jail, g):
-                ruler_lost = True
+            if _take_prisoner(state, jail, g):        # 군주 포획: 승계는 처분 확정까지 보류(§9-21 정정)
                 _chronicle(state, f"{op.faction} 군주 {g} 야전 포획")
             state.history.append(f"  ↳ {g} 야전 포로 → {jail}")
         elif home:
@@ -661,8 +654,83 @@ def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int) -> No
             state.cities[jail].prisoners.append(p)
     state.history.append(f"[야전 전멸] {op.faction} 작전{op.id} 궤멸")
     state.operations.remove(op)
-    if ruler_lost and state.factions.get(op.faction) and state.factions[op.faction].alive:
-        _succeed_ruler(state, op.faction)
+
+
+# ======================= 담화 (포로 즉결 처분) [[DISCUSSION#9-21]] =======================
+def pending_dispositions(state: GameState) -> list[tuple[str, str]]:
+    """처분 대기 포로 (도시, 포로) 목록. 턴 해소 직후 드라이버(턴 루프 호출자)가 순회하며 질의.
+
+    엔진은 나열·판정만 — LLM 질의는 드라이버 몫(decide→engine 단방향 유지).
+    """
+    return [(c.name, p) for c in state.cities.values() for p in list(c.prisoners)]
+
+
+def persuade_chance(state: GameState, city_name: str, prisoner: str, persuader: str) -> float:
+    """설득 확률(LLM 경로, 담화 안 돌리는 쪽) = (BASE + 설득 장수 지력/SCALE) × (1 − 포로 충의/100).
+
+    ⭐주체 = 처분에서 지정한 그 도시 주둔 장수(도시 최고지력 자동 아님, §9-21 정정).
+    ⭐cap 폐지: 충의는 확률 천장이 아니라 감쇄 계수(플레이어 경로에선 페르소나·심판에 내재).
+    현직 군주(is_ruler)·충의 100·주체 부재/타지는 0. 외교 협상도 이 베이스 재사용 예정.
+    """
+    city = state.cities.get(city_name)
+    gen = state.generals.get(prisoner)
+    agent = state.generals.get(persuader)
+    if (city is None or gen is None or agent is None or gen.is_ruler
+            or persuader not in city.generals):
+        return 0.0
+    return (PERSUADE_BASE + agent.intel / PERSUADE_INTEL_SCALE) * (1 - gen.loyalty / 100)
+
+
+def apply_disposition(state: GameState, city_name: str, prisoner: str,
+                      choice: str, chance: float | None = None, persuader: str = "") -> bool:
+    """포로 처분 실행(결정론). 처형=로스터 제거(군주면 이제서야 승계) / 석방=원 세력 복귀(군주면 군주로) / 설득=확률 판정.
+
+    chance: 설득 확률. None이면 LLM 경로 상수식(persuade_chance(persuader)), 플레이어 경로는 심판 채점값 주입.
+    설득 시도는 성패 무관 다음 턴 명령 상한 차감(PERSUADE_ORDER_COST). 반환=처분 성사(설득은 귀순 여부).
+    """
+    city = state.cities.get(city_name)
+    if city is None or prisoner not in city.prisoners:
+        state.history.append(f"[환각] 처분 대상 아님: {city_name}의 {prisoner} → 기각")
+        return False
+    owner = city.owner
+    if choice == "처형":
+        city.prisoners.remove(prisoner)
+        gen = state.generals.pop(prisoner, None)
+        _chronicle(state, f"{owner}, {prisoner} 처형")
+        if gen is not None and gen.is_ruler:          # ⭐군주는 처형 확정 시점에 승계(§9-21 정정)
+            lf = state.factions.get(gen.faction)
+            if lf is not None and lf.alive:
+                _succeed_ruler(state, gen.faction)
+        return True
+    if choice == "석방":
+        city.prisoners.remove(prisoner)
+        pf = state.generals[prisoner].faction if prisoner in state.generals else ""
+        dest = next((n for n in state.distances.get(city_name, {})
+                     if n in state.cities and state.cities[n].owner == pf),
+                    next((n for n in sorted(state.cities) if state.cities[n].owner == pf), None))
+        if dest:
+            state.cities[dest].generals.append(prisoner)
+        _chronicle(state, f"{owner}, {prisoner} 석방" + (f" → {dest}" if dest else "(재야)"))
+        return True
+    if choice == "설득":
+        if chance is None:                            # LLM 경로: 상수식. 불가(군주/충의/주체 무효)인데 골랐으면 환각
+            p = persuade_chance(state, city_name, prisoner, persuader)
+            if p <= 0:
+                state.history.append(f"[환각] {prisoner} 설득 불가(군주/충의/설득 장수 무효) → 기각")
+                return False
+        else:                                         # 플레이어 경로: 심판 채점 주입(0점=정당한 실패, 환각 아님)
+            p = max(0.0, chance)
+        state.order_debits[owner] = state.order_debits.get(owner, 0) + PERSUADE_ORDER_COST
+        if p > 0 and state.rng.random() < p:
+            city.prisoners.remove(prisoner)
+            city.generals.append(prisoner)
+            state.generals[prisoner].faction = owner
+            _chronicle(state, f"{prisoner}, {owner}에 귀순 (설득)")
+            return True
+        state.history.append(f"[담화] {owner}, {prisoner} 설득 실패 (확률 {p:.0%})")
+        return False
+    state.history.append(f"[환각] 알 수 없는 처분 '{choice}' → 기각")
+    return False
 
 
 # ======================= 승리 판정 =======================
@@ -701,10 +769,14 @@ def advance_turn(state: GameState, actions: list | dict) -> None:
         items = []
         for actor, acts in actions.items():
             acts = list(acts) if isinstance(acts, list) else [acts]
-            if len(acts) > MAX_ORDERS_PER_TURN:
+            # 설득 시도 대가: 이번 턴 명령 상한 차감(§9-21). 차감분은 소비 즉시 소멸.
+            cap = max(0, MAX_ORDERS_PER_TURN - state.order_debits.pop(actor, 0))
+            if len(acts) > MAX_ORDERS_PER_TURN:      # 절대 상한 초과 = LLM 폭주(A층 환각)
                 state.history.append(
                     f"[환각] {actor} 명령 {len(acts)}건 > 상한 {MAX_ORDERS_PER_TURN} → 초과분 무시")
-                acts = acts[:MAX_ORDERS_PER_TURN]
+            elif len(acts) > cap:                    # 차감 상한 초과 = 담화 대가(환각 아님)
+                state.history.append(f"[담화] {actor} 설득 대가로 명령 {len(acts) - cap}건 차감")
+            acts = acts[:cap]
             items.extend((actor, a) for a in acts)
     else:
         items = [(None, a) for a in actions]

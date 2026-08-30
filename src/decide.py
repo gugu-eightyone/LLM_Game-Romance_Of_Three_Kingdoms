@@ -11,9 +11,12 @@
 """
 from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Literal
 
-from .llm import structured_complete
+from pydantic import BaseModel, Field
+
+from .config import STRATEGY_MAX_CHARS
+from .llm import LLMError, structured_complete
 from .models import Action, Domestic, FactionName, GameState
 
 
@@ -90,7 +93,9 @@ def brief(state: GameState, faction: FactionName) -> str:
     f = state.factions[faction]
     mine = [n for n, c in state.cities.items() if c.owner == faction]
     other = [n for n, c in state.cities.items() if c.owner != faction]
-    lines = [f"[{state.year}년 {state.month}월] 우리={faction}, 군주={f.ruler}, 사기={f.morale}",
+    captive = any(f.ruler in c.prisoners for c in state.cities.values())   # 군주 피랍(승계 보류 중, §9-21)
+    lines = [f"[{state.year}년 {state.month}월] 우리={faction}, 군주={f.ruler}"
+             + ("(적에게 피랍!)" if captive else "") + f", 사기={f.morale}",
              "[우리 도시]", *[_city_line(state, n, True) for n in mine],
              "[타 세력 도시]", *[_city_line(state, n, False) for n in other]]
     if state.chronicle:                              # 주요 연혁 전량(굵직한 것만이라 짧음) — 원한·대세 기억용
@@ -127,6 +132,70 @@ def decide(state: GameState, faction: FactionName) -> list[Action] | None:
     ).actions
 
 
+# ======================= 담화: 포로 즉결 처분 질의 [[DISCUSSION#9-21]] =======================
+class Disposition(BaseModel):
+    """포로 처분 응답. 판정(확률·효과)은 엔진 몫, 여긴 선택만."""
+    choice: Literal["설득", "석방", "처형"]
+    persuader: str = ""                      # 설득일 때 담화를 맡을 그 도시 주둔 우리 장수(⭐지정 장수 지력이 확률)
+    reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
+
+
+DISPOSITION_SYSTEM = """당신은 삼국지 시대 {faction}의 군주다. 사로잡은 포로 한 명의 처분을 정하라.
+
+- 설득: 등용을 시도한다. persuader에 **[설득 후보]에 적힌 우리 장수 한 명**을 지정하라(그 장수의 지력이
+  성공 확률을 정한다, 후보별 확률이 아래에 있다). 시도하면 성패 무관 **다음 달 명령 1건을 소모**한다.
+  실패해도 포로는 남아 다음 달 다시 처분할 수 있다. 후보가 없으면 설득은 고를 수 없다(군주·충의 명장 포함).
+- 석방: 원 세력의 도시로 돌려보낸다(은혜를 베푸는 선택. 군주 포로를 풀어주면 군주로 복귀한다).
+- 처형: 목을 벤다(위협 제거, 그러나 원한이 연혁에 남는다. 군주를 베면 그 세력은 새 군주를 세운다).
+
+reason은 50자 이내 한국어 한 줄."""
+
+
+def decide_disposition(state: GameState, city: str, prisoner: str,
+                       options: list[tuple[str, float]]) -> Disposition | None:
+    """보유 세력 LLM에 포로 처분 질의(소호출). 실패 시 None=보류(포로 유지, 다음 턴 재질의).
+
+    options: 드라이버가 engine.persuade_chance로 계산한 (설득 장수, 확률) 후보(단방향 유지).
+    """
+    faction = state.cities[city].owner
+    g = state.generals.get(prisoner)
+    stat = f"통솔{g.command}·지력{g.intel}, 원 소속 {g.faction}" if g else "정보 없음"
+    lines = [f"[포로] {prisoner} ({stat}) — {city}에 수감",
+             "[설득 후보] " + (", ".join(f"{name}(확률 {p:.0%})" for name, p in options)
+                              if options else "(없음 — 설득 불가)"),
+             f"[우리 사정] 도시 {sum(1 for c in state.cities.values() if c.owner == faction)}개, "
+             f"사기 {state.factions[faction].morale}"]
+    if state.chronicle:
+        lines += ["[주요 연혁]", *[f"- {c}" for c in state.chronicle]]
+    try:
+        return structured_complete(
+            Disposition, DISPOSITION_SYSTEM.format(faction=faction), "\n".join(lines))
+    except LLMError:
+        return None                                  # 보류: 상태 무변, 다음 턴 재질의
+
+
+def resolve_dispositions(state: GameState, verbose: bool = False) -> None:
+    """턴 해소 직후 드라이버 훅: 잔존 포로 전부 보유 세력 LLM에 질의 → 엔진 적용.
+
+    플레이어 모드는 이 함수 대신 담화 화면(parley)이 그 세력 포로를 처리(Q4 결정함수 교체와 동형).
+    """
+    from .engine import apply_disposition, pending_dispositions, persuade_chance
+
+    for city, prisoner in pending_dispositions(state):
+        faction = state.cities[city].owner
+        if faction not in state.factions or not state.factions[faction].alive:
+            continue
+        options = [(g, p) for g in state.cities[city].generals
+                   if (p := persuade_chance(state, city, prisoner, g)) > 0]
+        d = decide_disposition(state, city, prisoner, options)
+        if d is None:
+            continue
+        if verbose:
+            print(f"  [담화] {faction} → {prisoner}: {d.choice}"
+                  + (f" (설득 장수 {d.persuader})" if d.choice == "설득" else "") + f" ({d.reason})")
+        apply_disposition(state, city, prisoner, d.choice, persuader=d.persuader)
+
+
 def decide_all(state: GameState) -> dict[FactionName, list[Action]]:
     """살아있는 전 세력의 명령. `advance_turn(state, 이 dict)`에 그대로 넣으면 소유권·상한까지 검증됨."""
     out: dict[FactionName, list[Action]] = {}
@@ -151,6 +220,7 @@ def demo(turns: int = 6) -> None:
             for a in acts:
                 print(f"  {f}: {a.model_dump_json(exclude_defaults=True)}")
         advance_turn(state, actions)
+        resolve_dispositions(state, verbose=True)    # 포획 포로 즉결 처분(§9-21)
         print(f"[{state.year}년 {state.month}월 종료]")
         print("\n".join(state.history[h0:]) or "  (변화 없음)")
         if state.winner:
