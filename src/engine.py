@@ -21,7 +21,8 @@ from .models import (
 
 # 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
 from .config import (
-    ATTRITION_RATE, CAPTURE_FLOOR, DEFAULT_SPEED, DOMESTIC_GAIN, ESCORT_MIN_TROOPS,
+    ATTRITION_RATE, CAPTURE_FLOOR, CITY_INCOME_FOOD, CITY_INCOME_GOLD,
+    DEFAULT_SPEED, DOMESTIC_GAIN, ESCORT_MIN_TROOPS, TROOPS_PER_FOOD,
     FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
     MAX_ORDERS_PER_TURN, MORALE_CITY_LOST, MORALE_CITY_TAKEN, MORALE_COMBAT_BAND,
     MORALE_FEAST_CAP, MORALE_RULER_CAPTURED,
@@ -367,6 +368,8 @@ def _arrive(state: GameState, op: ActiveOperation) -> None:
         state.operations.remove(op)
         return
     if op.action.mode == "공성":
+        if _join_friendly_siege(state, op, city):     # 이동 중 아군이 선점 함락/동맹 체결 → 입성/복귀
+            return
         op.prep = op.progress - op.threshold          # 조기도착 잉여(오만 >0) → 교전 선취(토루)
         op.stage = "교전"
         op.progress = 0
@@ -389,6 +392,26 @@ def _arrive(state: GameState, op: ActiveOperation) -> None:
             _return_home(state, op, "출격 종료(대상 없음)")
 
 
+def _join_friendly_siege(state: GameState, op: ActiveOperation, city) -> bool:
+    """공성 target이 그 사이 아군·동맹이 된 경우 해소(⭐2026-08-31 아군 상잔 버그 수정).
+
+    출발 시점 가드(start_operation)는 이동·교전 중의 소유 변경(아군의 선점 함락, 동맹 체결)을
+    못 본다 → 도착·라운드 시점에 재검사. 아군=입성(합류, 별도 '입성' 지시 불필요) / 동맹=복귀
+    (합류는 병력 소유권 위반 — 야전 구원 분기와 같은 원칙). 반환=해소됨.
+    """
+    if city.owner == op.faction:
+        city.troops += op.committed_troops
+        city.generals.extend(op.committed_generals)
+        state.history.append(
+            f"[작전{op.id}] {op.faction} {city.name} 입성(이미 아군 도시 — 공성 해소, 병력 {op.committed_troops})")
+        state.operations.remove(op)
+        return True
+    if allied(state, op.faction, city.owner):
+        _return_home(state, op, f"공성 취소({city.name}=동맹 도시)")
+        return True
+    return False
+
+
 def _siege_round(state: GameState, op: ActiveOperation) -> None:
     """공성 교전 1라운드: 군대 vs 성 수비대(seam① 재사용, wall 보너스). 돌파 시 함락.
 
@@ -397,6 +420,8 @@ def _siege_round(state: GameState, op: ActiveOperation) -> None:
     city = state.cities.get(op.action.target)
     if city is None:
         state.operations.remove(op)
+        return
+    if _join_friendly_siege(state, op, city):         # 교전 중 소유 변경(아군 상잔 방지) → 입성/복귀
         return
     dfac = state.factions.get(city.owner)
     atk_loss, def_loss, dominance = _combat_round(
@@ -945,6 +970,29 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
     return True
 
 
+# ======================= 경제 (매턴 수입·병량 소모) =======================
+def _economy_tick(state: GameState) -> None:
+    """턴 말 경제: 규모 비례 수입 → 주둔 병량 소모. 군량 부족=못 먹인 병사 탈영(결정론, ⭐2026-08-30).
+
+    턴 말인 이유: 턴 초에 넣으면 LLM이 브리핑에서 본 숫자와 어긋나 검산 불일치·과투입 노이즈.
+    size 0(테스트용 추상 도시)=경제 없음. 정상 틱은 로그 안 남김(16도시×매턴=스팸), 탈영만 기록.
+    """
+    # ponytail: 출전 부대는 병량 무소모(현지 조달 간주) — 장기 원정 어뷰징 보이면 출발지 청구로 승격.
+    for c in state.cities.values():
+        if c.size <= 0 or c.owner == "중립":
+            continue
+        c.gold += c.size * CITY_INCOME_GOLD
+        c.food += c.size * CITY_INCOME_FOOD
+        upkeep = c.troops // TROOPS_PER_FOOD
+        if c.food >= upkeep:
+            c.food -= upkeep
+        else:                                         # 부족분만큼 탈영 → 유지 가능한 규모로 자기 교정
+            desert = min(c.troops, (upkeep - c.food) * TROOPS_PER_FOOD)
+            c.food = 0
+            c.troops -= desert
+            state.history.append(f"[병량] {c.name}({c.owner}) 군량 부족 — 병사 {desert} 탈영")
+
+
 # ======================= 승리 판정 =======================
 def check_victory(state: GameState) -> None:
     """승리 = 천하통일(전 도시 단일 세력) 단일 조건. 참수 즉시승리 폐기(§9-16). 세력 소멸=도시0."""
@@ -996,6 +1044,7 @@ def advance_turn(state: GameState, actions: list | dict) -> None:
         _dispatch(state, a, actor)
     _advance_movement(state)                          # 이동중 작전 진행(필드 교전=고정)
     _resolve_combat(state)                            # 야전 쌍 → 공성 → 종료 판정
+    _economy_tick(state)                              # 수입·병량(턴 말 — 다음 brief가 갱신값을 봄)
     check_victory(state)
     state.month += 1
     if state.month > 12:

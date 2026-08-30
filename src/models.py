@@ -27,6 +27,8 @@ class City(BaseModel):
     food: int = 0
     gold: int = 0
     wall: int = 0            # 성벽 레벨: 공성 수비 보정(내정 성벽보수로 증가)
+    size: int = 0            # 도시 규모(정적 큐레이트 1~3): 경제 틱의 수입 배수. 0=경제 없음(테스트용 추상 도시).
+                             # 성벽과 분리한 이유: 성벽보수로 수입이 오르는 커플링 방지(규모는 불변).
     generals: list[str] = Field(default_factory=list)  # 주둔 장수(로스터 이름 참조)
     prisoners: list[str] = Field(default_factory=list)  # 이 도시에 수감된 포로(포획자=city.owner). 담화 co-location 기반. [[DISCUSSION#9-10]]
 
