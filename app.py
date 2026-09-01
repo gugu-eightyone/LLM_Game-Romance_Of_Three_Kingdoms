@@ -14,10 +14,10 @@ from pathlib import Path
 import streamlit as st
 from pydantic import BaseModel, Field
 
-from src.config import MAX_ORDERS_PER_TURN, PARLEY_MAX_ROUNDS
+from src.config import FOOD_ALERT_MONTHS, MAX_ORDERS_PER_TURN, PARLEY_MAX_ROUNDS
 from src.decide import action_judge, brief, decide, resolve_dispositions, resolve_proposals
 from src.engine import (_city_threats, _wall_hp, _wall_max, advance_turn, allied,
-                        apply_disposition, attempt_persuade, load_scenario,
+                        apply_disposition, attempt_persuade, food_runway, load_scenario,
                         respond_proposal, surrender_gate)
 from src.llm import LLMError, structured_complete
 from src.models import Battle, Diplomacy, Dispose, Domestic, GameState, OpCommand, Transfer
@@ -148,6 +148,13 @@ def state_panel() -> None:
                        delta_color="off")
     if s.alliances:
         st.caption("동맹: " + ", ".join(f"{a}-{b}" for a, b in s.alliances))
+    # ⭐군량 경보(중요 정보 하이라이트): 현 소모율로 FOOD_ALERT_MONTHS개월 내 고갈되는 내 도시
+    if player:
+        alerts = [(n, r) for n, c in s.cities.items() if c.owner == player
+                  and (r := food_runway(s, n)) is not None and r <= FOOD_ALERT_MONTHS]
+        if alerts:
+            st.warning("군량 경보 — " + ", ".join(
+                f"{n}: " + ("이번 달 고갈 위험" if r == 0 else f"{r}개월 내 고갈") for n, r in alerts))
 
     st.dataframe([{
         "도시": c.name, "소유": c.owner, "규모": c.size, "병력": c.troops,

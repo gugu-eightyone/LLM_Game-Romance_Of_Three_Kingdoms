@@ -24,6 +24,7 @@ from .models import (
 from .config import (
     ALLIANCE_DEFAULT_MONTHS, ATTRITION_RATE, CAPTURE_FLOOR, CITY_INCOME_FOOD, CITY_INCOME_GOLD,
     DEFAULT_SPEED, DOMESTIC_GAIN, DOMESTIC_MODIFIER_BOUND, ESCORT_MIN_TROOPS,
+    GARRISON_TROOPS_PER_FOOD, STRANDED_DESERTION,
     RECRUIT_CURVE_SCALE, STRATEGY_MODIFIER_BOUND, TROOPS_PER_FOOD,
     FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
     MAX_ORDERS_PER_TURN, MORALE_CITY_LOST, MORALE_CITY_TAKEN, MORALE_COMBAT_BAND,
@@ -38,7 +39,7 @@ from .config import (
 
 SCENARIO_PATH = Path(__file__).resolve().parent.parent / "data" / "scenario.json"
 
-# 심판 콜백(⭐2026-09-02 judge 배선): (state, faction, kind∈{전투,내정}, 전략문) → (점수 1~5, 사유) | None(실패).
+# 심판 콜백(⭐2026-09-02 judge 배선): (state, faction, kind∈{전투,내정}, 전략문) → (점수 1~10, 사유) | None(실패).
 # LLM 호출은 판단층(decide) 몫 — 엔진은 콜백으로 주입받아 점수→보정 산수만(단방향 유지, 테스트=None이면 결정론 무변).
 JudgeFn = Callable[["GameState", str, str, str], "tuple[int, str] | None"]
 
@@ -1213,25 +1214,66 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
 
 # ======================= 경제 (매턴 수입·병량 소모) =======================
 def _economy_tick(state: GameState) -> None:
-    """턴 말 경제: 규모 비례 수입 → 주둔 병량 소모. 군량 부족=못 먹인 병사 탈영(결정론, ⭐2026-08-30).
+    """턴 말 경제: 규모 비례 수입 → 주둔 병량(⭐차등: 원정의 절반) → 출전 부대 병량(출발지 청구). 부족=탈영.
 
     턴 말인 이유: 턴 초에 넣으면 LLM이 브리핑에서 본 숫자와 어긋나 검산 불일치·과투입 노이즈.
-    size 0(테스트용 추상 도시)=경제 없음. 정상 틱은 로그 안 남김(16도시×매턴=스팸), 탈영만 기록.
+    전 도시 size 0(수제 테스트 상태)=경제 없는 판. 정상 틱은 로그 안 남김(16도시×매턴=스팸), 탈영만 기록.
     """
-    # ponytail: 출전 부대는 병량 무소모(현지 조달 간주) — 장기 원정 어뷰징 보이면 출발지 청구로 승격.
+    if not any(c.size > 0 for c in state.cities.values()):
+        return                                        # 경제 없는 판 — 수입도 병량도 고립 탈영도 없음
     for c in state.cities.values():
         if c.size <= 0 or c.owner == "중립":
             continue
         c.gold += c.size * CITY_INCOME_GOLD
         c.food += c.size * CITY_INCOME_FOOD
-        upkeep = c.troops // TROOPS_PER_FOOD
+        upkeep = c.troops // GARRISON_TROOPS_PER_FOOD  # ⭐주둔=절반 소모(사용자 차등)
         if c.food >= upkeep:
             c.food -= upkeep
         else:                                         # 부족분만큼 탈영 → 유지 가능한 규모로 자기 교정
-            desert = min(c.troops, (upkeep - c.food) * TROOPS_PER_FOOD)
+            desert = min(c.troops, (upkeep - c.food) * GARRISON_TROOPS_PER_FOOD)
             c.food = 0
             c.troops -= desert
             state.history.append(f"[병량] {c.name}({c.owner}) 군량 부족 — 병사 {desert} 탈영")
+    # ⭐출전 부대 병량 = 균일·복귀지(출발지) 청구(사용자 2026-09-02 — 거리 비례 기각). 주둔이 먼저 먹고
+    # 원정군이 남은 창고를 축냄. 부족분=그 부대에서 탈영. 고립(복귀지 없음)=보급 두절, 매턴 비율 탈영(말라죽음).
+    for op in state.operations:
+        if op.committed_troops <= 0 or op.faction == "중립":
+            continue
+        supply = _home_city(state, op)
+        if supply is None:                            # ⭐고립=굶주림(사용자 (b) 확정) — 회군(구사일생)만이 살길
+            desert = round(op.committed_troops * STRANDED_DESERTION)
+            if desert:
+                op.committed_troops -= desert
+                state.history.append(
+                    f"[병량] 작전{op.id}({op.faction}) 고립 — 보급 두절, 병사 {desert} 탈영")
+            continue
+        c = state.cities[supply]
+        if c.size <= 0:
+            continue
+        upkeep = op.committed_troops // TROOPS_PER_FOOD
+        if c.food >= upkeep:
+            c.food -= upkeep
+        else:
+            desert = min(op.committed_troops, (upkeep - c.food) * TROOPS_PER_FOOD)
+            c.food = 0
+            op.committed_troops -= desert
+            state.history.append(
+                f"[병량] 작전{op.id}({op.faction}) 군량 부족({supply} 창고 고갈) — 병사 {desert} 탈영")
+
+
+def food_runway(state: GameState, name: str) -> int | None:
+    """현 소모율(주둔 차등+이 도시가 청구받는 원정분) 기준 군량 고갈까지 남은 개월. 흑자·경제 없음=None.
+
+    ⭐군량 경보(사용자 "3달 내 위험 시그널") — 피침 경보와 동형: 결정론 결론을 brief·UI에 박는다.
+    """
+    c = state.cities[name]
+    if c.size <= 0 or c.owner == "중립":
+        return None
+    burn = c.troops // GARRISON_TROOPS_PER_FOOD
+    burn += sum(o.committed_troops // TROOPS_PER_FOOD for o in state.operations
+                if o.faction == c.owner and o.committed_troops > 0 and _home_city(state, o) == name)
+    net = c.size * CITY_INCOME_FOOD - burn
+    return c.food // -net if net < 0 else None
 
 
 # ======================= 승리 판정 =======================

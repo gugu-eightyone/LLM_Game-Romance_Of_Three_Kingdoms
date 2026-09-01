@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .config import SIEGE_BASE, STRATEGY_MAX_CHARS, WALL_HP_SCALE
+from .config import FOOD_ALERT_MONTHS, SIEGE_BASE, STRATEGY_MAX_CHARS, WALL_HP_SCALE
 from .llm import LLMError, structured_complete
 from .models import Action, Domestic, FactionName, GameState
 from .prompts import load as load_prompt
@@ -74,6 +74,11 @@ def _city_line(state: GameState, name: str, own: bool) -> str:
                 parts.append(f"⚠피침: {t.faction}군 {t.committed_troops} {eta}")
     if own:
         parts += [f"식{c.food}", f"금{c.gold}"]
+        from .engine import food_runway               # 드라이버와 같은 지연 임포트(단방향: engine은 decide를 모름)
+        runway = food_runway(state, name)
+        if runway is not None and runway <= FOOD_ALERT_MONTHS:  # ⭐군량 경보: 결정론 결론 박기(피침 경보와 동형)
+            parts.append("⚠군량: " + ("이번 달 고갈 위험" if runway == 0
+                                      else f"현 소모율로 {runway}개월 내 고갈"))
     if c.generals:
         parts.append("장수 " + ",".join(f"{g}(통{state.generals[g].command})"
                                        if g in state.generals else g for g in c.generals))
