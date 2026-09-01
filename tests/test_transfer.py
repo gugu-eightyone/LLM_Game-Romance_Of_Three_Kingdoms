@@ -1,7 +1,8 @@
 """호송(Transfer) + 한 턴 멀티 명령 테스트 (증분2). 전부 오프라인.
 
 호송 = 병사·장수·포로·금·식량을 인접 아군 도시로. 호위 최소 200(장수 단독 면제).
-멀티 명령 = 세력당 턴 상한 MAX_ORDERS_PER_TURN, 적힌 순서대로 처리.
+멀티 명령 = 세력당 턴 상한 MAX_ORDERS_PER_TURN. 처리=카테고리 phase(외교→전투→내정, ⭐2026-09-01),
+같은 카테고리 안은 적힌 순서.
 """
 from src.models import Battle, City, Domestic, Faction, GameState, General, Transfer
 from src.engine import advance_turn, load_scenario
@@ -85,16 +86,15 @@ def test_orders_capped_per_turn():
     assert any("[환각]" in h and "상한" in h for h in s.history)
 
 
-def test_orders_processed_in_sequence():
-    """모병을 먼저 적으면 그 병력으로 같은 턴 출격 가능(순서대로 즉시 처리)."""
+def test_recruit_not_usable_same_turn():
+    """⭐카테고리 phase(2026-09-01): 내정=맨 뒤라 모병을 먼저 적어도 같은 턴 출격엔 못 쓴다(신병=다음 달)."""
     s = _state()
     advance_turn(s, {"촉": [
-        Domestic(kind="내정", city="성도", item="모병", gold_spent=1000),   # +2000 → 12000
+        Domestic(kind="내정", city="성도", item="모병", gold_spent=1000),   # 내정 phase → 전투 뒤 집행
         Battle(kind="전투", mode="공성", origin="성도", target="업", troops=12000),
     ]})
-    assert any(op.committed_troops == 12000 for op in s.operations) or \
-        any("함락" in h for h in s.history)                 # 12000 전부 투입됐다(클램프 안 걸림)
-    assert not any("[환각]" in h and "과투입" in h for h in s.history)
+    assert any("[환각]" in h and "과투입" in h for h in s.history)   # 전투 시점 보유 10000 → 클램프
+    assert s.cities["성도"].troops == 0 + 1000 * 2          # 전량 출격 후 모병 2000이 다음 달 몫으로 남음
 
 
 def test_dest_captured_mid_transit_returns_home():

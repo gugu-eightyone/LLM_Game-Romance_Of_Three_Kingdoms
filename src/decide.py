@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .config import STRATEGY_MAX_CHARS
+from .config import SIEGE_BASE, STRATEGY_MAX_CHARS, WALL_HP_SCALE
 from .llm import LLMError, structured_complete
 from .models import Action, Domestic, FactionName, GameState
 from .prompts import load as load_prompt
@@ -33,7 +33,9 @@ SYSTEM = load_prompt("decide_system")
 def _city_line(state: GameState, name: str, own: bool) -> str:
     c = state.cities[name]
     # 병0 도시는 "출병 불가"를 글자로 박음(잔여 병력 대조를 mini에게 추론시키지 않기)
-    parts = [f"병{c.troops}" + ("(출병 불가)" if own and c.troops <= 0 else ""), f"벽{c.wall}"]
+    wall_max = (SIEGE_BASE + c.wall) * WALL_HP_SCALE  # 파손 성벽만 표기(온전=무표기, 토큰 절약). engine 미임포트(단방향)
+    wall = f"벽{c.wall}" + (f"(파손 {c.wall_hp}/{wall_max})" if 0 <= c.wall_hp < wall_max else "")
+    parts = [f"병{c.troops}" + ("(출병 불가)" if own and c.troops <= 0 else ""), wall]
     friends = {x for pair in state.alliances if c.owner in pair for x in pair}  # 동맹은 위협 아님(§9-22)
     if own:  # 피침 경보: "내 도시가 공격받는 중"을 추론시키지 않고 결론으로 박음(전부 결정론)
         for t in state.operations:
@@ -80,7 +82,9 @@ def brief(state: GameState, faction: FactionName) -> str:
         lines.append("[진행 중 작전]")
         # 동행 장수 표기: 출전 장수는 도시 줄에서 빠지므로 여기 안 적으면 LLM 눈에 증발 → 미보유 재지정 환각
         lines += [f"- [{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"
-                  f" {o.stage} {o.progress:g}/{o.threshold:g} 병력{o.committed_troops} 사기{o.unit_morale}"
+                  + (f" 교전 중" if o.stage == "교전"     # 공성 게이지=도시 줄의 성벽 파손 표기(HP화)
+                     else f" 이동 {o.progress:g}/{o.threshold:g}")
+                  + f" 병력{o.committed_troops} 사기{o.unit_morale}"
                   + (f" 장수 {','.join(o.committed_generals)}(출전 중)" if o.committed_generals else "")
                   + (" ← 아군: 자동 계속. 이 작전에 새 출격을 또 내리지 마라(별도 부대가 추가로 나간다) — 변경·철수는 작전지시로"
                      if o.faction == faction else "")
@@ -161,7 +165,8 @@ def resolve_dispositions(state: GameState, verbose: bool = False,
             continue
         if verbose:
             print(f"  [담화] {faction} → {prisoner}: {d.choice} ({d.reason})")
-        apply_disposition(state, city, prisoner, d.choice)
+        if not apply_disposition(state, city, prisoner, d.choice):
+            state.pending_captives.append((city, prisoner))   # 무효 처분(군주 수감 등) → 다음 턴 재질의
 
 
 # ======================= 외교: 제안 응답 질의 [[DISCUSSION#9-22]] =======================
@@ -199,18 +204,26 @@ def resolve_proposals(state: GameState, verbose: bool = False,
 
     player: 그 세력이 받는 제안(항복 권유 포함)은 LLM에 안 묻고 큐에 남김 → 결과 창에서
     직접 수락/거절(수락한 항복 권유 = 패배 엔딩. Q4 결정함수 교체와 동형, UI는 Streamlit 때).
+
+    ⭐2026-09-01 재작성(전수조사 🔴2·5): 큐를 통째 비우고 한 통씩 소비(pop 모델) — 같은 턴 항복
+    수락이 큐를 필터링해도 이중 삭제 크래시(ValueError)가 없다. 발신 세력이 그 사이 소멸한 제안도
+    폐기(죽은 세력과 동맹 체결 방지). 보류·플레이어 몫만 큐에 되돌린다.
     """
     from .engine import respond_proposal
 
-    for prop in list(state.proposals):
+    pending, state.proposals = list(state.proposals), []
+    for prop in pending:
+        sender = state.factions.get(prop.from_faction)
         target = state.factions.get(prop.to_faction)
-        if target is None or not target.alive:        # 그 사이 멸망 → 제안 소멸
-            state.proposals.remove(prop)
+        if (target is None or not target.alive
+                or sender is None or not sender.alive):   # 수신/발신 세력 소멸 → 제안 폐기
             continue
         if prop.to_faction == player:                 # 플레이어 몫 → 결과 창이 소비하게 잔존
+            state.proposals.append(prop)
             continue
         r = decide_proposal_response(state, prop)
-        if r is None:
+        if r is None:                                 # 호출 실패 → 보류(다음 턴 재질의)
+            state.proposals.append(prop)
             continue
         if verbose:
             print(f"  [외교] {prop.to_faction} ← {prop.from_faction} {prop.proposal}: "

@@ -14,11 +14,11 @@ from pathlib import Path
 import streamlit as st
 from pydantic import BaseModel, Field
 
-from src.config import MAX_ORDERS_PER_TURN, PARLEY_MAX_ROUNDS, SURRENDER_DOMINANCE
+from src.config import MAX_ORDERS_PER_TURN, PARLEY_MAX_ROUNDS
 from src.decide import brief, decide, resolve_dispositions, resolve_proposals
-from src.engine import (_city_threats, _faction_power, advance_turn, allied,
+from src.engine import (_city_threats, _wall_hp, _wall_max, advance_turn, allied,
                         apply_disposition, attempt_persuade, load_scenario,
-                        respond_proposal)
+                        respond_proposal, surrender_gate)
 from src.llm import LLMError, structured_complete
 from src.models import Battle, Diplomacy, Domestic, GameState, OpCommand, Transfer
 from src.parley import (ParleyReply, _fallen, judge_parley, prisoner_reply,
@@ -149,7 +149,8 @@ def state_panel() -> None:
         st.caption("동맹: " + ", ".join(f"{a}-{b}" for a, b in s.alliances))
 
     st.dataframe([{
-        "도시": c.name, "소유": c.owner, "규모": c.size, "병력": c.troops, "성벽": c.wall,
+        "도시": c.name, "소유": c.owner, "규모": c.size, "병력": c.troops,
+        "성벽": f"{c.wall} ({_wall_hp(c)}/{_wall_max(c)})",
         "식량": c.food, "금": c.gold, "장수": ", ".join(c.generals),
         "포로": ", ".join(c.prisoners),
         "인접": ", ".join(f"{n}({d})" for n, d in s.distances.get(c.name, {}).items()),
@@ -158,8 +159,10 @@ def state_panel() -> None:
     if s.operations:
         st.markdown("**진행 중 작전**")
         for o in s.operations:
-            # 진행도는 이동·공성만 의미 있음. 야전 교전은 이동 잔여치가 남아있어 숫자를 내면 오독(가분수).
-            phase = (f"공성 진행 {o.progress:g}/{o.threshold:g}" if o.stage == "교전" and o.action.mode == "공성"
+            # 진행도는 이동만 숫자. 공성 게이지=성벽 HP(도시 소유, ⭐HP화). 야전 교전=이동 잔여치 가분수라 무숫자.
+            tgt = s.cities.get(o.action.target)
+            phase = (f"공성 중 · 성벽 {_wall_hp(tgt)}/{_wall_max(tgt)}" if o.stage == "교전"
+                     and o.action.mode == "공성" and tgt is not None
                      else "교전 중" if o.stage == "교전"
                      else f"이동 {o.progress:g}/{o.threshold:g}개월")
             st.text(f"[{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"
@@ -179,6 +182,8 @@ def order_builder() -> None:
     s, player = S(), st.session_state.player
     left = orders_left()
     st.subheader(f"이번 달 명령 ({MAX_ORDERS_PER_TURN - left}/{MAX_ORDERS_PER_TURN})")
+    st.caption("처리 순서: 외교 → 전투 → 내정(같은 부류는 적은 순서대로). "
+               "세력 간 순서는 공정성을 위해 매달 시드 랜덤. 모병한 병력은 다음 달부터 출격 가능.")
     for i, a in enumerate(st.session_state.orders):
         c1, c2 = st.columns([9, 1])
         c1.code(a.model_dump_json(exclude_defaults=True), language="json")
@@ -226,7 +231,8 @@ def order_builder() -> None:
         item = st.radio("항목", ["식량증산", "모병", "사기진작", "성벽보수"], horizontal=True, key="d_i")
         gold = st.number_input(f"투입 금 (보유 {s.cities[city_n].gold:,})",
                                0, max(0, s.cities[city_n].gold), 0, key="d_g",
-                               help="금 1 → 식량/병력 2 전환. 성벽보수는 금 3000당 1레벨.")
+                               help="금 1 → 식량/병력 2 전환. 성벽보수 = 파손된 성벽 HP 복구(금 3당 1, 온전하면 기각). "
+                                    "사기진작은 사기 80까지만(금 500당 1).")
         strat = st.text_input("방침(50자, 서사)", max_chars=50, key="d_s")
         if st.button("명령 추가", key="d_add", disabled=left <= 0):
             st.session_state.orders.append(Domestic(
@@ -280,7 +286,7 @@ def order_builder() -> None:
                            for p in c.prisoners if s.generals.get(p) and s.generals[p].faction == player]
             if my_captured:
                 opts.append("포로반환")
-            if _faction_power(s, player) >= SURRENDER_DOMINANCE * max(1, _faction_power(s, t)):
+            if surrender_gate(s, player, t):          # 게이트: 상대 도시 ≤2 + 국력 우위(엔진과 공유)
                 opts.append("항복권유")
             prop = st.radio("제안", opts, horizontal=True, key="dp_p")
             prisoner, og, of = "", 0, 0
@@ -396,9 +402,12 @@ def results_screen() -> None:
         for city_n, p in my_captives:
             g = s.generals.get(p)
             c0, c1, c2, c3 = st.columns([3, 1, 1, 1])
+            ruler = bool(g and g.is_ruler and s.factions.get(g.faction) and s.factions[g.faction].alive)
             c0.text(f"{p} ({city_n}, 원 소속 {g.faction if g else '미상'}"
-                    + (", 군주!" if g and g.is_ruler else "") + ")")
+                    + (", 군주! — 석방/처형만" if ruler else "") + ")")
             for col, choice in ((c1, "석방"), (c2, "수감"), (c3, "처형")):
+                if choice == "수감" and ruler:        # ⭐군주=2지선다(§9-21 복원) — 수감 버튼 미노출
+                    continue
                 if col.button(choice, key=f"disp_{city_n}_{p}_{choice}"):
                     apply_disposition(s, city_n, p, choice)
                     s.pending_captives.remove((city_n, p))

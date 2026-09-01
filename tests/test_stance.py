@@ -71,24 +71,28 @@ def _manual_siege(s: GameState, troops: int = 10000) -> None:
 
 
 def test_sortie_engages_and_slows_siege():
-    """대조 조건 통제: 잔류 수비대가 같을 때, 출성이 있으면 공성 진행이 덜 나간다.
+    """대조 조건 통제: 잔류 수비대가 같을 때, 출성이 있으면 성벽 피해가 덜 들어간다(⭐HP화).
 
     (출성은 수비대를 빼가 성의 우세도를 올리는 부작용도 있으므로 — 그게 배분 리스크 —
-    순수 감속 효과는 '같은 잔류 수비대' 비교로 격리한다. wall=0으로 커플링 변수도 차단.)
+    순수 감속 효과는 '같은 잔류 수비대' 비교로 격리한다. wall=0으로 커플링 변수도 차단.
+    wall_hp를 크게 심어 함락 없이 피해량만 측정.)
     """
+    GUARD = 1_000_000
     # 대조군: 수비 5000(출성 없음)
     s0 = _mini_state()
     s0.cities["한중"].troops, s0.cities["한중"].wall = 5000, 0
     s0.cities["한중"].generals = []
+    s0.cities["한중"].wall_hp = GUARD
     _manual_siege(s0)
     advance_turn(s0, [])
-    base_progress = s0.operations[0].progress
-    assert base_progress > 0                         # 우세 공성이 실제로 진행됨
+    base_damage = GUARD - s0.cities["한중"].wall_hp
+    assert base_damage > 0                           # 우세 공성이 실제로 성벽을 깎음
 
     # 실험군: 수비 8000에서 3000 출성 → 잔류 5000 동일 + 성 앞 야전
     s1 = _mini_state()
     s1.cities["한중"].troops, s1.cities["한중"].wall = 8000, 0
     s1.cities["한중"].generals = []
+    s1.cities["한중"].wall_hp = GUARD
     _manual_siege(s1)
     sortie = start_operation(s1, Battle(kind="전투", mode="야전", origin="한중", target="한중",
                                         troops=3000))
@@ -96,8 +100,7 @@ def test_sortie_engages_and_slows_siege():
     assert s1.cities["한중"].troops == 5000                # 수비대에서 분할 차감
     advance_turn(s1, [])
     assert any("[야전]" in h for h in s1.history)          # 공성군과 실제 교전 발생
-    siege = next(o for o in s1.operations if o.action.mode == "공성")
-    assert siege.progress < base_progress            # 출성 견제(감속)+야전 소모로 진행 감소
+    assert GUARD - s1.cities["한중"].wall_hp < base_damage  # 출성 견제(감속)+야전 소모로 피해 감소
     assert any("출성 견제" in h for h in s1.history)
 
 

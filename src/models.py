@@ -26,7 +26,9 @@ class City(BaseModel):
     troops: int = 0          # 순수 int: 음수 탐지는 B층이 담당(여기서 clamp/raise 안 함)
     food: int = 0
     gold: int = 0
-    wall: int = 0            # 성벽 레벨: 공성 수비 보정(내정 성벽보수로 증가)
+    wall: int = 0            # 성벽 레벨(정적): 수비 보너스·최대 HP의 기준. 증축은 미구현(⭐레벨=큐레이트 유지)
+    wall_hp: int = -1        # 성벽 내구도(⭐2026-09-01 HP화): -1=미초기화(만액으로 파생 — 구 세이브·수제 상태 호환),
+                             # 0=돌파됨. 최대 = (SIEGE_BASE+레벨)×WALL_HP_SCALE. 공성이 깎고 보수·자연회복이 채움.
     size: int = 0            # 도시 규모(정적 큐레이트 1~3): 경제 틱의 수입 배수. 0=경제 없음(테스트용 추상 도시).
                              # 성벽과 분리한 이유: 성벽보수로 수입이 오르는 커플링 방지(규모는 불변).
     generals: list[str] = Field(default_factory=list)  # 주둔 장수(로스터 이름 참조)

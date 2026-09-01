@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .models import (
-    ActiveOperation, Battle, Diplomacy, Domestic, GameState, OpCommand, Persuade, Proposal,
-    Scheme, Transfer,
+    ActiveOperation, Battle, City, Diplomacy, Domestic, GameState, OpCommand, Persuade,
+    Proposal, Scheme, Transfer,
 )
 
 # 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
@@ -27,10 +27,11 @@ from .config import (
     MAX_ORDERS_PER_TURN, MORALE_CITY_LOST, MORALE_CITY_TAKEN, MORALE_COMBAT_BAND,
     MORALE_FEAST_CAP, MORALE_RULER_CAPTURED,
     PERSUADE_BASE, PERSUADE_INTEL_SCALE, PREP_CAP, PREP_RATE,
-    SURRENDER_CITY_WEIGHT, SURRENDER_DOMINANCE,
+    SURRENDER_CITY_GATE, SURRENDER_CITY_WEIGHT,
     RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE, SIEGE_RATE,
     SIEGE_RETREAT_SURVIVAL, SORTIE_SLOW_CAP, UNIT_MORALE_COMBAT_DROP,
-    WALL_DEFENSE, WALL_MANNING,
+    WALL_CAPTURE_HEAL_RATIO, WALL_DEFENSE, WALL_HP_SCALE, WALL_MANNING,
+    WALL_REGEN_PER_TURN, WALL_REPAIR_GOLD_PER_HP,
 )
 
 SCENARIO_PATH = Path(__file__).resolve().parent.parent / "data" / "scenario.json"
@@ -63,6 +64,30 @@ def _is_river(state: GameState, a: str, b: str) -> bool:
     """구간 (a,b)가 강인가(무순서). 도하 지연·증분2 수전 보정 판정."""
     pair = {a, b}
     return any(pair == set(e) for e in state.river_edges)
+
+
+# ======================= 성벽 HP (⭐2026-09-01 A안: 게이지 주인=도시) =======================
+def _wall_max(city: City) -> int:
+    """성벽 최대 HP = (SIEGE_BASE + 레벨) × 환산상수. 레벨은 정적(수비 보너스·정원제도 레벨 기준 유지)."""
+    return (SIEGE_BASE + city.wall) * WALL_HP_SCALE
+
+
+def _wall_hp(city: City) -> int:
+    """현재 성벽 HP. -1(미초기화)=만액 — 구 세이브·수제 테스트 상태가 자동으로 온전한 성이 된다."""
+    return _wall_max(city) if city.wall_hp < 0 else city.wall_hp
+
+
+def _wall_regen(state: GameState, skip: frozenset[str] = frozenset()) -> None:
+    """평시 성벽 자연회복(전간기 복구): 피침(접근 포함) 아닐 때만 월 +REGEN, 만액까지. 정상 틱=무로그(스팸).
+
+    skip: 이번 턴 주인 바뀐 도시(전투로 밤샌 성 — 점령 응급 보수만 받고 자연회복은 다음 달부터).
+    """
+    for c in state.cities.values():
+        if c.wall_hp < 0 or c.owner == "중립" or c.name in skip:   # 미초기화(만액)=회복할 것 없음
+            continue
+        m = _wall_max(c)
+        if c.wall_hp < m and not _city_threats(state, c.name, c.owner):
+            c.wall_hp = min(m, c.wall_hp + WALL_REGEN_PER_TURN)
 
 
 # ======================= 전투 (seam ①: 군대 vs 군대 일반화) =======================
@@ -222,13 +247,26 @@ def apply_domestic(state: GameState, action: Domestic, actor: str | None = None)
         state.history.append(f"[위반] {actor}가 남의 도시 '{action.city}'({city.owner}) 내정 시도 → 기각")
         return
     spend = min(action.gold_spent, city.gold)
+    if action.item == "성벽보수":                     # ⭐HP화(2026-09-01): 보수=파손 복구(레벨 증축 아님, 만액 상한)
+        heal_cap = _wall_max(city) - _wall_hp(city)
+        if heal_cap <= 0:
+            state.history.append(f"[기각] {city.owner} {action.city} 성벽보수 — 성벽이 온전함(파손 없음)")
+            return
+        heal = min(heal_cap, spend // WALL_REPAIR_GOLD_PER_HP)
+        if heal <= 0:
+            state.history.append(f"[기각] {city.owner} {action.city} 성벽보수 — 금 부족(HP 1당 금 {WALL_REPAIR_GOLD_PER_HP})")
+            return
+        cost = heal * WALL_REPAIR_GOLD_PER_HP         # 파손분만큼만 과금(초과 지출 안 받음)
+        city.gold -= cost
+        city.wall_hp = _wall_hp(city) + heal
+        state.history.append(
+            f"[내정] {city.owner} {action.city} 성벽보수 (HP +{heal} → {city.wall_hp}/{_wall_max(city)}, 금 {cost})")
+        return
     city.gold -= spend
     if action.item == "식량증산":
         city.food += spend * DOMESTIC_GAIN
     elif action.item == "모병":
         city.troops += spend * DOMESTIC_GAIN
-    elif action.item == "성벽보수":
-        city.wall += max(1, spend // 3000)
     elif action.item == "사기진작":
         f = state.factions.get(city.owner)
         if f and f.morale < MORALE_FEAST_CAP:  # 만찬 천장(⭐금 도배 방지): 그 위 사기는 승리(함락)로만
@@ -373,7 +411,7 @@ def _arrive(state: GameState, op: ActiveOperation) -> None:
         op.prep = op.progress - op.threshold          # 조기도착 잉여(오만 >0) → 교전 선취(토루)
         op.stage = "교전"
         op.progress = 0
-        op.threshold = SIEGE_BASE + city.wall
+        op.threshold = 0                              # ⭐HP화: 함락 게이지=도시의 wall_hp(진행도 폐기)
         prep_note = f", 준비 {op.prep:.2f}" if op.prep > 0 else ""
         state.history.append(f"[작전{op.id}] {op.faction} 부대 {city.name} 도착 → 공성 개시{prep_note}")
     else:                                             # 야전: 그 도시 공성중인 적 있으면 구원 교전
@@ -413,8 +451,10 @@ def _join_friendly_siege(state: GameState, op: ActiveOperation, city) -> bool:
 
 
 def _siege_round(state: GameState, op: ActiveOperation) -> None:
-    """공성 교전 1라운드: 군대 vs 성 수비대(seam① 재사용, wall 보너스). 돌파 시 함락.
+    """공성 교전 1라운드: 군대 vs 성 수비대(seam① 재사용, wall 보너스). 성벽 HP 0 = 돌파 → 함락.
 
+    ⭐HP화(2026-09-01): 우세도가 공격군의 진행도 대신 **도시의 wall_hp를 깎는다** — 손상이 도시 소유라
+    공성 주체가 바뀌어도(3파전) 물리적으로 정당하게 이어진다(구 "진행도 승계" 구멍 해소).
     공격=부대 사기(op.unit_morale), 수비=전역 사기(수성=작전 아님 → 세력값). 전멸/퇴각은 `_resolve_op_end`.
     """
     city = state.cities.get(op.action.target)
@@ -434,17 +474,19 @@ def _siege_round(state: GameState, op: ActiveOperation) -> None:
     op.committed_troops -= atk_loss
     op.unit_morale = max(0, op.unit_morale - UNIT_MORALE_COMBAT_DROP)
     city.troops -= def_loss
-    # 출성 감속(§9-20): 성 앞 아군 출성 부대 규모에 비례해 공성 진행이 늦어진다(정지는 없음, 캡).
+    # 출성 감속(§9-20): 성 앞 아군 출성 부대 규모에 비례해 성벽 피해가 줄어든다(정지는 없음, 캡).
     sortie_troops = sum(o.committed_troops for o in state.operations
                         if o.faction == city.owner and o.stage == "교전"
                         and o.action.mode == "야전" and o.action.origin == o.action.target == op.action.target)
     slow = min(SORTIE_SLOW_CAP, sortie_troops / op.committed_troops) if sortie_troops and op.committed_troops > 0 else 0.0
-    op.progress += max(0, round(dominance * SIEGE_RATE * (1 - slow)))
+    dmg = max(0, round(dominance * SIEGE_RATE * WALL_HP_SCALE * (1 - slow)))
+    city.wall_hp = max(0, _wall_hp(city) - dmg)
     slow_note = f", 출성 견제 −{slow:.0%}" if slow else ""
     state.history.append(                             # 라운드 가시화(F층 관측성·관전): 무음 공성 해소
         f"[작전{op.id}] {op.faction} {city.name} 공성 중 "
-        f"(진행 {op.progress:g}/{op.threshold:g}, 병력 {op.committed_troops} vs 수비 {city.troops}{slow_note})")
-    if op.committed_troops > 0 and (city.troops <= 0 or op.progress >= op.threshold):
+        f"(성벽 {city.wall_hp}/{_wall_max(city)}, 병력 {op.committed_troops} vs 수비 {city.troops}{slow_note})")
+    # 돌파(HP 0)여도 우세도 ≤0이면 함락 아님 — 이미 무너진 성도 수비대가 우세하면 지켜낸다(약체 공성의 날먹 방지).
+    if op.committed_troops > 0 and (city.troops <= 0 or (city.wall_hp <= 0 and dominance > 0)):
         _capture_city(state, op, city)
 
 
@@ -493,21 +535,57 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
                 _chronicle(state, f"{winner}, {loser} 군주 {g} 포획")
 
     lf = state.factions.get(loser)
-    if lf is None or loser == "중립":
-        return
-    remaining = [n for n, c in state.cities.items() if c.owner == loser]
-    if not remaining:                                # 전 도시 상실 → 세력 소멸
-        lf.alive = False
-        state.alliances = [p for p in state.alliances if loser not in p]      # 망국의 동맹·제안 자동 소멸
-        state.proposals = [p for p in state.proposals if loser not in (p.from_faction, p.to_faction)]
-        state.history.append(f"⚔ {loser} 멸망 (전 도시 상실)")
-        _chronicle(state, f"{loser} 멸망")
+    if lf is not None and loser != "중립":
+        remaining = [n for n, c in state.cities.items() if c.owner == loser]
+        if not remaining:                            # 전 도시 상실 → 세력 소멸
+            lf.alive = False
+            state.alliances = [p for p in state.alliances if loser not in p]      # 망국의 동맹·제안 자동 소멸
+            state.proposals = [p for p in state.proposals if loser not in (p.from_faction, p.to_faction)]
+            # ⭐2026-09-01 좀비 세력 차단: 망국의 잔존 출전 부대는 정복 세력에 투항(마지막 함락 도시로 흡수).
+            # 투항 장수만 승자 소속 전환 — 타지 수감 포로 등은 원 소속 유지(망국 인재 설득 개방 §9-21⑤ 보존).
+            for op2 in [o for o in state.operations if o.faction == loser]:
+                city.troops += max(0, op2.committed_troops)
+                city.generals.extend(op2.committed_generals)
+                city.prisoners.extend(op2.cargo_prisoners)
+                city.gold += op2.cargo_gold
+                city.food += op2.cargo_food
+                for g in op2.committed_generals:
+                    if g in state.generals:
+                        state.generals[g].faction = winner
+                        state.generals[g].is_ruler = False
+                state.operations.remove(op2)
+                state.history.append(f"[작전{op2.id}] {loser} 잔존 부대, {winner}에 투항(병력 {op2.committed_troops})")
+            state.history.append(f"⚔ {loser} 멸망 (전 도시 상실)")
+            _chronicle(state, f"{loser} 멸망")
+    _liberate_prisoners(state, city)                 # 소유 변경된 감옥 정리(자국 포로 해방, ⭐2026-09-01)
+
+
+def _liberate_prisoners(state: GameState, city: City) -> None:
+    """소유 변경된 도시의 감옥 정리(⭐2026-09-01): 새 소유주 소속 포로 = 해방·즉시 합류.
+
+    함락(탈환)·항복 흡수 공용 — "내 군주/장수가 내 도시의 포로로 영구 감금"되는 경계 구멍의 단일 수리 지점.
+    타 세력 포로는 그대로 승계(약탈 관례). 해방자는 즉결 질의 큐에서도 제거.
+    """
+    freed = [p for p in list(city.prisoners)
+             if p in state.generals and state.generals[p].faction == city.owner]
+    for p in freed:
+        city.prisoners.remove(p)
+        city.generals.append(p)
+        state.history.append(f"  ↳ 아군 포로 {p} 해방({city.name} 수복)")
+    if freed:
+        state.pending_captives = [(c, g) for c, g in state.pending_captives
+                                  if not (c == city.name and g in freed)]
 
 
 def _succeed_ruler(state: GameState, faction: str) -> None:
-    """군주 포획 시 최고 통솔 생존 장수 자동 승계(충성도·내분 X = 스코프 크립 회피). [[DISCUSSION#9-16]]"""
-    cand = [g for c in state.cities.values() if c.owner == faction for g in c.generals]
-    if not cand:                                     # 승계할 장수 없음(무두 잔존 → 다음 함락서 정리)
+    """군주 처형 시 최고 통솔 생존 장수 자동 승계(충성도·내분 X = 스코프 크립 회피). [[DISCUSSION#9-16]]
+
+    ⭐후보 = 세력 소속 전체(출전 중 포함, 수감·처형자 제외) — 도시 주둔만 집계하면 전 장수 출전 중일 때
+    ruler=""가 영구 공석이 되는 구멍(2026-09-01 전수조사)."""
+    jailed = {p for c in state.cities.values() for p in c.prisoners}
+    cand = [g.name for g in state.generals.values()
+            if g.faction == faction and g.name not in jailed]
+    if not cand:                                     # 승계할 장수 없음(전원 수감/사망)
         state.factions[faction].ruler = ""
         return
     heir = max(cand, key=lambda g: state.generals[g].command if g in state.generals else 0)
@@ -545,8 +623,12 @@ def _field_engaged_ids(state: GameState) -> set[int]:
     return {op.id for pair in _field_engagements(state) for op in pair}
 
 
-def _field_round(state: GameState, a: ActiveOperation, b: ActiveOperation) -> None:
-    """야전 1라운드(부대 vs 부대, wall=0, 순수 대칭). 협공은 '두 번 맞음'으로 자연 발생(보너스 없음)."""
+def _field_round(state: GameState, a: ActiveOperation, b: ActiveOperation,
+                 killers: dict[int, str]) -> None:
+    """야전 1라운드(부대 vs 부대, wall=0, 순수 대칭). 협공은 '두 번 맞음'으로 자연 발생(보너스 없음).
+
+    killers: 이 라운드에서 상대를 궤멸시킨 세력 기록(마지막 타격 귀속) — 전리품·포로가 승자에게 가게(⭐2026-09-01).
+    """
     a_loss, b_loss, _ = _combat_round(
         state,
         Force(a.committed_troops, a.committed_generals, morale=a.unit_morale),
@@ -556,6 +638,10 @@ def _field_round(state: GameState, a: ActiveOperation, b: ActiveOperation) -> No
     a.unit_morale = max(0, a.unit_morale - UNIT_MORALE_COMBAT_DROP)
     b.unit_morale = max(0, b.unit_morale - UNIT_MORALE_COMBAT_DROP)
     a.has_fought = b.has_fought = True
+    if a.committed_troops <= 0:
+        killers[a.id] = b.faction
+    if b.committed_troops <= 0:
+        killers[b.id] = a.faction
     state.history.append(
         f"[야전] 작전{a.id}({a.faction}) ↔ 작전{b.id}({b.faction}): -{a_loss}/-{b_loss}")
 
@@ -564,15 +650,16 @@ def _resolve_combat(state: GameState) -> None:
     """한 턴 전투 해소: 야전(필드 쌍) → 공성(수비대) → 종료(전멸/퇴각/포로) → 야전 승자 복귀."""
     pairs = _field_engagements(state)
     n_opp: dict[int, int] = {}
+    killers: dict[int, str] = {}                     # 궤멸 op → 마지막 타격 세력(전리품 귀속, ⭐2026-09-01)
     for a, b in pairs:
-        _field_round(state, a, b)
+        _field_round(state, a, b, killers)
         n_opp[a.id] = n_opp.get(a.id, 0) + 1
         n_opp[b.id] = n_opp.get(b.id, 0) + 1
     for op in list(state.operations):                # 공성 라운드(필드 피해 반영된 병력으로 → 협공 자연 발생)
         if op.action.mode == "공성" and op.stage == "교전":
             _siege_round(state, op)
     for op in list(state.operations):                # 종료 판정
-        _resolve_op_end(state, op, n_opp.get(op.id, 0))
+        _resolve_op_end(state, op, n_opp.get(op.id, 0), killers.get(op.id))
     engaged = {op.id for pair in pairs for op in pair}
     for op in list(state.operations):                # 야전 승자(교전 마치고 상대 소멸) → 자동 복귀(서브초이스2)
         if op.action.mode != "야전" or op.id in engaged or op.committed_troops <= 0:
@@ -584,13 +671,14 @@ def _resolve_combat(state: GameState) -> None:
             _return_home(state, op, "출성 해제(위협 소멸)")
 
 
-def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int) -> None:
+def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int,
+                    killer: str | None = None) -> None:
     """전멸(야전 피해→포로 / 공성 붕괴→격퇴) + 확률적 강제 퇴각(사기 붕괴)."""
     if op not in state.operations:                   # 이미 함락 등으로 해소
         return
     if op.committed_troops <= 0:
         if n_field > 0:
-            _destroy_field_op(state, op, n_field)    # 야전 전멸 → 장수 포획(base×부대수)·화물 노획
+            _destroy_field_op(state, op, n_field, killer)  # 야전 전멸 → 장수 포획(base×부대수)·화물 노획
         elif op.action.mode != "호송":               # 장수 단독 호송(병력 0)은 정상 → 계속 간다
             # 격퇴 사기 훅은 안 둠(⭐사기=세력 정신적 무장 → 국지 전투 승패는 제외, 함락/상실/피랍만)
             _return_home(state, op, "격퇴" if op.action.mode == "공성" else "무위", troops=False)
@@ -692,10 +780,20 @@ def _take_prisoner(state: GameState, holding_city: str, g: str) -> bool:
     return False
 
 
-def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int) -> None:
-    """야전 전멸: 장수 포획확률 = base × 교전 적 부대 수. 포획=최근접 적 도시 호송(탈영 없음), 실패=아군 복귀."""
+def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int,
+                      killer: str | None = None) -> None:
+    """야전 전멸: 장수 포획확률 = base × 교전 적 부대 수. 실패=아군 복귀.
+
+    ⭐포로·노획 = 전멸시킨 세력(killer, 마지막 타격) 귀속(2026-09-01) — 구 "지리적 최근접 적성 도시"는
+    싸우지도 않은 제3세력·동맹이 수취하던 구멍. killer 불명(공성 중 소멸 등)일 때만 구 규칙 폴백.
+    """
     prob = min(1.0, FIELD_CAPTURE_BASE * n_field)
-    jail = _nearest_enemy_city(state, op)
+    jail = None
+    if killer:
+        jail = _nearest_city_of(state, op, killer) or next(
+            (n for n in sorted(state.cities) if state.cities[n].owner == killer), None)
+    if jail is None:
+        jail = _nearest_enemy_city(state, op)
     home = _home_city(state, op)
     for g in list(op.committed_generals):
         if jail and state.rng.random() < prob:
@@ -785,6 +883,12 @@ def apply_disposition(state: GameState, city_name: str, prisoner: str, choice: s
                 _succeed_ruler(state, gen.faction)
         return True
     if choice == "수감":                              # 처분 유예: 계속 가둬둠(이후 설득 명령·몸값 협상 대상). 무료.
+        gen = state.generals.get(prisoner)
+        lf = state.factions.get(gen.faction) if gen else None
+        if gen is not None and gen.is_ruler and lf is not None and lf.alive:
+            # ⭐군주(세력 생존)=석방/처형 2지선다(§9-21 원안 복원, 2026-09-01) — 수감 시 피랍 영구화 방지
+            state.history.append(f"[환각] 군주 {prisoner}는 수감 불가(석방/처형만) → 기각")
+            return False
         state.history.append(f"[담화] {owner}, {prisoner} 수감 유지")
         return True
     if choice == "석방":
@@ -832,6 +936,16 @@ def _faction_power(state: GameState, faction: str) -> int:
     troops += sum(o.committed_troops for o in state.operations if o.faction == faction)
     n_cities = sum(1 for c in state.cities.values() if c.owner == faction)
     return troops + n_cities * SURRENDER_CITY_WEIGHT
+
+
+def surrender_gate(state: GameState, me: str, target: str) -> bool:
+    """항복권유 성립 게이트(⭐2026-09-01 교체): 상대 잔여 도시 ≤ SURRENDER_CITY_GATE + 제안측 국력 우위.
+
+    구 "국력 3배"는 대세력 흡수 직후 차순위 세력에 바로 성립하는 민감도 문제. 수락 여부는 여전히 상대 군주 LLM.
+    앱 UI(위젯 노출)와 엔진 검증이 이 한 곳을 공유한다.
+    """
+    n = sum(1 for c in state.cities.values() if c.owner == target)
+    return n <= SURRENDER_CITY_GATE and _faction_power(state, me) > _faction_power(state, target)
 
 
 
@@ -882,9 +996,9 @@ def apply_diplomacy(state: GameState, action: Diplomacy, actor: str | None = Non
         return
 
     if action.proposal == "항복권유":
-        # ⭐게이트=결정론(비등하면 확률 0이 아니라 제안 자체 불성립). 수락 여부만 상대 군주 판단.
-        if _faction_power(state, me) < SURRENDER_DOMINANCE * max(1, _faction_power(state, t)):
-            state.history.append(f"[기각] {me}의 {t} 항복 권유 — 대세가 그만큼 기울지 않음")
+        # ⭐게이트=결정론(성립 안 하면 확률 0이 아니라 제안 자체 불성립). 수락 여부만 상대 군주 판단.
+        if not surrender_gate(state, me, t):
+            state.history.append(f"[기각] {me}의 {t} 항복 권유 — 대세가 그만큼 기울지 않음(말기 세력에만 성립)")
             return
         if any(p.proposal == "항복권유" and p.to_faction == t for p in state.proposals):
             state.history.append(f"[기각] {t} 항복 권유 중복")
@@ -938,13 +1052,15 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
                 c.gold += op2.cargo_gold
                 c.food += op2.cargo_food
             state.operations.remove(op2)
-        for c in state.cities.values():
-            if c.owner == b:
-                c.owner = a
+        taken = [c for c in state.cities.values() if c.owner == b]
+        for c in taken:
+            c.owner = a
         for g in state.generals.values():
             if g.faction == b:
                 g.faction = a
                 g.is_ruler = False                    # 항복 군주 = 승자의 신하(일개 장수)
+        for c in taken:                               # 흡수한 감옥 정리: a 소속(구 b 포함) 포로 해방(⭐2026-09-01)
+            _liberate_prisoners(state, c)
         lf.alive = False
         state.alliances = [p for p in state.alliances if b not in p]
         state.proposals = [p for p in state.proposals if b not in (p.from_faction, p.to_faction)]
@@ -1022,29 +1138,57 @@ def _dispatch(state: GameState, action, actor: str | None = None) -> None:
         state.history.append(f"[증분2] 계략({action.scheme_type}) 미구현 → 무시")
 
 
+def _order_phase(action) -> int:
+    """명령 카테고리(⭐2026-09-01 phase 확정): 0=외교 → 1=전투(출격·작전지시·호송) → 2=내정(내정·설득·계략)."""
+    if isinstance(action, Diplomacy):
+        return 0
+    if isinstance(action, (Domestic, Persuade, Scheme)):
+        return 2
+    return 1
+
+
 def advance_turn(state: GameState, actions: list | dict) -> None:
     """한 달 진행: 개시/내정 → 이동(마일스톤) → 전투 해소(야전·공성·퇴각·포로) → 승리 → 시간.
 
     actions: `{세력: Action | list[Action]}` dict면 행위자 소유권 검증 + 명령 상한(LLM 경로),
-             그냥 list면 검증 생략(스크립트 데모·테스트가 상태를 직접 짜는 경우).
-    명령은 적힌 순서대로 즉시 처리(모병 → 그 병력으로 같은 턴 출격 가능).
+             그냥 list면 검증 생략·종전 순서 그대로(스크립트 데모·테스트가 상태를 직접 짜는 경우).
+
+    ⭐dict 경로 처리 순서(2026-09-01 확정): **외교 → 전투 → 내정** 카테고리 phase.
+    같은 세력·같은 카테고리 안은 적힌 순서 유지(회군→재출격 같은 턴 성립). 세력 간 순서=매턴
+    시드 셔플(선공 편향 제거·재현 가능, 전 phase 공통 — UI·프롬프트에 고지). 모병→같은 턴 출격
+    콤보는 의도적 소멸(내정이 마지막 — 신병은 다음 달부터). 파기→공격 배신 콤보=생존(외교 선행).
     """
     if isinstance(actions, dict):
-        items = []
+        per_faction: dict[str, list] = {}
         for actor, acts in actions.items():
             acts = list(acts) if isinstance(acts, list) else [acts]
             if len(acts) > MAX_ORDERS_PER_TURN:
                 state.history.append(
                     f"[환각] {actor} 명령 {len(acts)}건 > 상한 {MAX_ORDERS_PER_TURN} → 초과분 무시")
                 acts = acts[:MAX_ORDERS_PER_TURN]
-            items.extend((actor, a) for a in acts)
+            per_faction[actor] = acts
+        order = list(per_faction)
+        state.rng.shuffle(order)
+        items = [(actor, a) for phase in (0, 1, 2)
+                 for actor in order
+                 for a in per_faction[actor] if _order_phase(a) == phase]
     else:
         items = [(None, a) for a in actions]
+    owners0 = {n: c.owner for n, c in state.cities.items()}   # 점령 회복 판정용 스냅샷(⭐사용자)
     for actor, a in items:
         _dispatch(state, a, actor)
     _advance_movement(state)                          # 이동중 작전 진행(필드 교전=고정)
     _resolve_combat(state)                            # 야전 쌍 → 공성 → 종료 판정
     _economy_tick(state)                              # 수입·병량(턴 말 — 다음 brief가 갱신값을 봄)
+    captured = frozenset(n for n, c in state.cities.items() if c.owner != owners0.get(n))
+    _wall_regen(state, skip=captured)                 # 평시 성벽 자연회복(피침·점령 턴 제외, ⭐HP화)
+    for n in captured:                                # ⭐점령 응급 보수: 턴 말, 최대 HP의 RATIO만큼(전투 간섭 0)
+        c = state.cities[n]
+        m = _wall_max(c)
+        healed = min(m, _wall_hp(c) + round(m * WALL_CAPTURE_HEAL_RATIO))
+        if healed != _wall_hp(c):
+            c.wall_hp = healed
+            state.history.append(f"[점령] {n} 성벽 응급 보수 → {healed}/{m}")
     check_victory(state)
     state.month += 1
     if state.month > 12:

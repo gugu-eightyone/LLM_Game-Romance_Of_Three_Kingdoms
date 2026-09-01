@@ -144,12 +144,16 @@ def test_domestic_recruit_deducts_gold():
     assert s.cities["성도"].gold == 5000 - 1000
 
 
-def test_domestic_wall_and_overspend_clamp():
+def test_domestic_wall_repair_heals_damage_only():
+    """⭐HP화: 보수=파손 복구(레벨 불변·만액 상한·파손분만 과금). 온전한 성벽=기각·금 미소모."""
     s = _mini_state()
-    # 보유(2000) 초과 지출 요청 → 보유만큼만 차감
+    c = s.cities["한중"]                                 # wall 1 → 최대 HP (2+1)×1000 = 3000
+    apply_domestic(s, Domestic(kind="내정", city="한중", item="성벽보수", gold_spent=1000))
+    assert c.gold == 2000 and any("온전" in h for h in s.history)
+    c.wall_hp = 2700                                     # 파손 300
     apply_domestic(s, Domestic(kind="내정", city="한중", item="성벽보수", gold_spent=999999))
-    assert s.cities["한중"].gold == 0
-    assert s.cities["한중"].wall > 1                     # 성벽 상승
+    assert c.wall_hp == 3000 and c.wall == 1             # 만액까지만 복구, 레벨 불변
+    assert c.gold == 2000 - 300 * 3                      # 파손분(300×금3)만 과금 — 초과 지출 안 받음
 
 
 def test_morale_hard_clamp_at_100():
