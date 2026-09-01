@@ -209,6 +209,122 @@ def test_surrender_mid_queue_no_crash_no_dead_alliance(monkeypatch):
     assert s.proposals == []
 
 
+# ---------- 경미 잔건 일괄(2026-09-02) ----------
+def test_isolated_destroy_no_silent_vanish():
+    """고립(복귀지 없음) 전멸 시 장수=적성 감옥 확정 포로 — 무로그 증발 금지."""
+    s = _state(seed=3)
+    s.cities["낙양"].owner = "오"                      # 위=무도시(고립 확정)
+    s.cities["낙양"].generals.remove("장료")
+    op = ActiveOperation(id=9, faction="위", stage="이동", threshold=1, committed_troops=0,
+                         committed_generals=["장료"],
+                         action=Battle(kind="전투", mode="야전", origin="낙양", target="성도", troops=0))
+    s.operations.append(op)
+    _destroy_field_op(s, op, n_field=1, killer="오")   # 확률 15% — 실패해도 고립 포로로 수렴
+    held = any("장료" in c.prisoners for c in s.cities.values())
+    assert held and any("장료" in h for h in s.history)
+
+
+def test_strand_general_never_vanishes():
+    """⭐무증발 원칙: 복귀지 없는 장수 = 아군 아무 도시 구사일생, 아군 전무 = 아무 적성 도시 포로."""
+    from src.engine import _strand_general
+    s = _state()
+    op = ActiveOperation(id=11, faction="위", stage="이동", threshold=1, committed_troops=0,
+                         committed_generals=[],
+                         action=Battle(kind="전투", mode="야전", origin="성도", target="건업", troops=0))
+    _strand_general(s, op, "장료")
+    assert "장료" in s.cities["낙양"].generals          # 아군 도시가 있으면 구사일생 귀환
+    s2 = _state()
+    s2.cities["낙양"].owner = "오"                     # 위=무도시
+    _strand_general(s2, op, "장료")
+    assert any("장료" in c.prisoners for c in s2.cities.values())   # 최후엔 포로 — 증발은 없다
+
+
+def test_isolated_return_releases_cargo_prisoners():
+    """고립 복귀 실패: 화물 포로=해방(전멸 경로와 일관), 금·식량·장수 소실은 로깅."""
+    from src.engine import _return_home
+    s = _state()
+    s.cities["낙양"].owner = "오"                      # 위=무도시
+    s.cities["성도"].generals.remove("조운")
+    op = ActiveOperation(id=8, faction="위", stage="이동", threshold=1, committed_troops=200,
+                         committed_generals=[], cargo_gold=300, cargo_prisoners=["조운"],
+                         action=Battle(kind="전투", mode="야전", origin="낙양", target="성도", troops=200))
+    s.operations.append(op)
+    _return_home(s, op, "격퇴")
+    assert "조운" in s.cities["성도"].generals          # 포로 해방 → 원 세력(촉) 최근접
+    assert any("고립 소실" in h and "금300" in h for h in s.history)
+    assert any("해산" in h and "200" in h for h in s.history)   # 위=무도시 → 병사 해산(무로그 증발 금지)
+
+
+def test_isolated_troops_survive_to_far_city():
+    """⭐고립 귀환 병사(사용자 지적): 먼 아군 도시가 있으면 절반 생환(SIEGE_RETREAT_SURVIVAL 재사용)."""
+    from src.engine import _return_home
+    s = GameState(
+        cities={"X": City(name="X", owner="오", troops=100), "Y": City(name="Y", owner="오", troops=100),
+                "Z": City(name="Z", owner="위", troops=100)},   # Z=위의 먼 도시(간선 없음=인접권 밖)
+        factions={"위": Faction(name="위", ruler="조조"), "오": Faction(name="오", ruler="손권")},
+        generals={},
+        distances={"X": {"Y": 1}, "Y": {"X": 1}},
+    )
+    op = ActiveOperation(id=12, faction="위", stage="이동", threshold=1, committed_troops=200,
+                         committed_generals=[],
+                         action=Battle(kind="전투", mode="야전", origin="X", target="Y", troops=200))
+    s.operations.append(op)
+    _return_home(s, op, "격퇴")
+    assert s.cities["Z"].troops == 100 + 100            # 절반 생환
+    assert any("구사일생 귀환" in h for h in s.history)
+
+
+def test_ghost_convoy_does_not_end_interceptor():
+    """병력 0 호송(장수 단독)을 잡은 요격대는 '임무 완료' 귀환하지 않는다(유령 교전 방지)."""
+    from src.models import Transfer
+    s = GameState(
+        seed=0,
+        cities={"A": City(name="A", owner="촉", troops=9000, generals=["조운"]),
+                "B": City(name="B", owner="촉", troops=100),
+                "C": City(name="C", owner="위", troops=9000)},
+        factions={"촉": Faction(name="촉", ruler="유비"), "위": Faction(name="위", ruler="조조")},
+        generals={"조운": General(name="조운", command=91, faction="촉")},
+        distances={"A": {"B": 3}, "B": {"A": 3, "C": 1}, "C": {"B": 1}},
+    )
+    advance_turn(s, [Transfer(kind="호송", origin="A", target="B", generals=["조운"])])
+    s.cities["B"].owner = "위"                         # 목적지가 전선화 → 위 요격대가 같은 간선 역주행
+    advance_turn(s, [Battle(kind="전투", mode="야전", origin="B", target="A", troops=8000)])
+    # 2턴째 이동에서 progress 합(2+1)=3 ≥ 거리 3 → 교차 → 호송(병0) 즉시 전멸, 요격대는 계속 전진해야
+    advance_turn(s, [])
+    assert not any(o.action.mode == "호송" for o in s.operations)
+    interceptor = [o for o in s.operations if o.faction == "위"]
+    assert interceptor and not interceptor[0].has_fought   # 유령 교전으로 임무 종료되지 않음
+    assert not any("요격 완료" in h for h in s.history)
+
+
+def test_sortie_regroups_into_city_after_fight():
+    """⭐한 번 싸운 출성 부대는 위협 접근 중이어도 성내 복귀=재정비(성 밖 대기는 수비 분할만 지속 — 사용자).
+
+    선타가 필요하면 예비 출성 규칙(도착 전 재출성)으로 다시 내보내는 게 정답."""
+    s = _state()
+    sortie = ActiveOperation(id=6, faction="위", stage="교전", threshold=0, committed_troops=3000,
+                             committed_generals=[], has_fought=True,
+                             action=Battle(kind="전투", mode="야전", origin="낙양", target="낙양", troops=3000))
+    s.operations.append(sortie)
+    s.operations.append(ActiveOperation(                # 촉 공성군 접근 중(이동) = 위협 잔존
+        id=7, faction="촉", stage="이동", threshold=5, committed_troops=9000, committed_generals=[],
+        action=Battle(kind="전투", mode="공성", origin="성도", target="낙양", troops=9000)))
+    troops0 = s.cities["낙양"].troops
+    advance_turn(s, [])
+    assert not any(o.id == 6 for o in s.operations)     # 성내 복귀
+    assert s.cities["낙양"].troops == troops0 + 3000    # 수비대 합류(재정비)
+
+
+def test_two_factions_can_offer_surrender_to_same_target():
+    s = _state()
+    s.cities["건업"].troops = 100                       # 오=말기(도시1·국력 열세)
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="항복권유"), actor="위")
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="항복권유"), actor="촉")
+    assert len(s.proposals) == 2                        # 발신자 다르면 중복 아님
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="항복권유"), actor="위")
+    assert len(s.proposals) == 2 and any("중복" in h for h in s.history)   # 같은 발신자만 기각
+
+
 # ---------- 카테고리 phase(외교→전투→내정) + 시드 재현성 ----------
 def test_diplomacy_phase_precedes_battle():
     """⭐파기를 공성 '뒤에' 적어도 외교 phase가 먼저 → 파기→공격이 순서 무관 성립."""

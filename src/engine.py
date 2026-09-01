@@ -704,11 +704,14 @@ def _field_round(state: GameState, a: ActiveOperation, b: ActiveOperation,
         state,
         Force(a.committed_troops, a.committed_generals, morale=a.unit_morale, mod=a.strategy_mod),
         Force(b.committed_troops, b.committed_generals, morale=b.unit_morale, mod=b.strategy_mod))
+    a0, b0 = a.committed_troops, b.committed_troops
     a.committed_troops -= a_loss
     b.committed_troops -= b_loss
     a.unit_morale = max(0, a.unit_morale - UNIT_MORALE_COMBAT_DROP)
     b.unit_morale = max(0, b.unit_morale - UNIT_MORALE_COMBAT_DROP)
-    a.has_fought = b.has_fought = True
+    # 유령 교전 방지: 병력 0 호송(장수 단독)을 잡은 건 "교전"이 아님 — 요격대가 임무 완료로 조기 귀환하지 않게.
+    a.has_fought = a.has_fought or b0 > 0
+    b.has_fought = b.has_fought or a0 > 0
     if a.committed_troops <= 0:
         killers[a.id] = b.faction
     if b.committed_troops <= 0:
@@ -736,6 +739,8 @@ def _resolve_combat(state: GameState) -> None:
         if op.action.mode != "야전" or op.id in engaged or op.committed_troops <= 0:
             continue
         if op.has_fought:
+            # 출성 포함: 교전이 끝나면 성내 복귀=재정비(⭐사용자 — 성 밖 대기는 수비 분할만 지속.
+            # 새 위협에 선타를 원하면 예비 출성 규칙으로 도착 전에 다시 내보내면 된다).
             _return_home(state, op, "요격 완료")
         elif (op.action.origin == op.action.target   # 대기 중 출성: 위협이 사라지면 성내 복귀(합류)
               and not _city_threats(state, op.action.target, op.faction)):
@@ -801,8 +806,24 @@ def _nearest_city_of(state: GameState, op: ActiveOperation, faction: str) -> str
     return None
 
 
+def _strand_general(state: GameState, op: ActiveOperation, g: str) -> None:
+    """복귀지 없는 장수의 최후 수용처(⭐무증발 원칙 — '행방불명' 없음): 아군 아무 도시로 구사일생 귀환,
+    아군 도시가 전무하면 아무 적성 도시에 포로. 지도에 도시가 늘 있으므로 장수는 반드시 어딘가에 있다."""
+    own = next((n for n in sorted(state.cities) if state.cities[n].owner == op.faction), None)
+    if own:
+        state.cities[own].generals.append(g)
+        state.history.append(f"  ↳ {g} 구사일생 귀환 → {own}")
+        return
+    jail = next((n for n in sorted(state.cities)
+                 if state.cities[n].owner not in (op.faction, "중립")), None)
+    if jail:
+        if _take_prisoner(state, jail, g):
+            _chronicle(state, f"{op.faction} 군주 {g} 포획")
+        state.history.append(f"  ↳ {g} 고립 포로 → {jail}")
+
+
 def _return_home(state: GameState, op: ActiveOperation, reason: str, troops: bool = True) -> None:
-    """출격/작전 종료 → 생존군·장수 아군 도시 복귀. 고립(복귀지 없음)이면 장수 소실."""
+    """출격/작전 종료 → 생존군·장수 아군 도시 복귀. 고립(복귀지 없음)=포로 해방+소실 로깅(무로그 증발 금지)."""
     dest = _home_city(state, op)
     if dest:
         c = state.cities[dest]
@@ -812,6 +833,25 @@ def _return_home(state: GameState, op: ActiveOperation, reason: str, troops: boo
         c.gold += op.cargo_gold                       # 호송 화물도 함께 귀환(전투 op는 전부 0)
         c.food += op.cargo_food
         c.prisoners.extend(op.cargo_prisoners)
+    else:
+        for p in op.cargo_prisoners:                  # 호송 중 포로=해방(전멸 경로와 일관 — 호송자가 무너지면 풀려남)
+            pf = state.generals[p].faction if p in state.generals else ""
+            free = _nearest_city_of(state, op, pf)
+            if free:
+                state.cities[free].generals.append(p)
+                state.history.append(f"  ↳ 포로 {p} 해방 → {free}")
+        for g in op.committed_generals:               # 장수=구사일생/고립 포로(무증발 원칙, ⭐"행방불명 기분 나쁨")
+            _strand_general(state, op, g)
+        far = next((n for n in sorted(state.cities) if state.cities[n].owner == op.faction), None)
+        if troops and op.committed_troops > 0:        # ⭐병사도 처리(사용자 지적): 먼 아군 도시로 절반 생환(패주 규칙 재사용)
+            if far:
+                survivors = round(op.committed_troops * SIEGE_RETREAT_SURVIVAL)
+                state.cities[far].troops += survivors
+                state.history.append(f"  ↳ 병사 {survivors}/{op.committed_troops} 구사일생 귀환 → {far}")
+            else:                                     # 돌아갈 나라가 없음 → 해산(무로그 증발 금지)
+                state.history.append(f"  ↳ 병사 {op.committed_troops} 해산(돌아갈 나라 없음)")
+        if op.cargo_gold or op.cargo_food:            # 물자는 버려진다(패주의 대가)
+            state.history.append(f"  ↳ 고립 소실: 금{op.cargo_gold}·식{op.cargo_food}")
     state.history.append(f"[작전{op.id}] {op.faction} {reason} → {dest or '복귀 실패(고립)'}")
     if op in state.operations:
         state.operations.remove(op)
@@ -873,6 +913,12 @@ def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int,
             state.history.append(f"  ↳ {g} 야전 포로 → {jail}")
         elif home:
             state.cities[home].generals.append(g)     # 포획 실패 → 아군 복귀
+        elif jail:                                    # 복귀지 없음(고립)=적진에 남겨짐 → 확정 포로("고립=포획의 대가")
+            if _take_prisoner(state, jail, g):
+                _chronicle(state, f"{op.faction} 군주 {g} 야전 포획")
+            state.history.append(f"  ↳ {g} 고립 포로 → {jail}")
+        else:                                         # 인접권에 감옥도 복귀지도 없음 → 전국 폴백(무증발)
+            _strand_general(state, op, g)
     if jail and (op.cargo_gold or op.cargo_food):     # 호송 화물 = 요격측 노획
         state.cities[jail].gold += op.cargo_gold
         state.cities[jail].food += op.cargo_food
@@ -1072,7 +1118,8 @@ def apply_diplomacy(state: GameState, action: Diplomacy, actor: str | None = Non
         if not surrender_gate(state, me, t):
             state.history.append(f"[기각] {me}의 {t} 항복 권유 — 대세가 그만큼 기울지 않음(말기 세력에만 성립)")
             return
-        if any(p.proposal == "항복권유" and p.to_faction == t for p in state.proposals):
+        if any(p.proposal == "항복권유" and p.from_faction == me and p.to_faction == t
+               for p in state.proposals):             # 중복=같은 발신자만(타 세력의 권유는 별건)
             state.history.append(f"[기각] {t} 항복 권유 중복")
             return
         state.proposals.append(Proposal(from_faction=me, to_faction=t, proposal="항복권유",

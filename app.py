@@ -107,7 +107,7 @@ def end_turn() -> None:
             st.session_state.over = "승리! 천하통일" if s.winner == player else f"패배 — {s.winner} 천하통일"
         elif not s.factions[player].alive:
             st.session_state.over = "패배 — 세력 멸망"
-        elif ruler0 and any(f"{ruler0} 처형" in c for c in s.chronicle[c0:]):
+        elif ruler0 and any(f", {ruler0} 처형" in c for c in s.chronicle[c0:]):  # 연혁 서식 "{처형자}, {이름} 처형" 정합 매칭(접미 이름 오탐 방지)
             st.session_state.over = f"패배 — 군주 {ruler0} 처형당함"
     elif s.winner:
         st.session_state.over = f"{s.winner} 천하통일"
@@ -203,6 +203,10 @@ def order_builder() -> None:
         else:
             origin = st.selectbox("출발 도시", armed, key="b_o")
             city = s.cities[origin]
+            # 이미 큐에 담긴 같은 도시 출격·호송 병력을 차감해 상한 표시(엔진 클램프에 기대지 않기)
+            reserved = sum(getattr(o, "troops", 0) for o in st.session_state.orders
+                           if getattr(o, "origin", None) == origin and o.kind in ("전투", "호송"))
+            avail = max(0, city.troops - reserved)
             modes = ["공성", "야전"] + (["출성"] if _city_threats(s, origin, player) else [])
             mode = st.radio("종류", modes, horizontal=True, key="b_m",
                             help="야전=방면 요격/구원. 출성=피침 도시 성 앞 포진(수비대 분할).")
@@ -214,14 +218,14 @@ def order_builder() -> None:
                            and not allied(s, player, s.cities[n].owner)] if mode == "공성" \
                     else [n for n in adj if n != origin]
                 target = st.selectbox("목표", targets, key="b_t") if targets else None
-            troops = st.number_input(f"병력 (가용 {city.troops:,})", 1, max(1, city.troops),
-                                     min(10000, city.troops), key="b_n")
+            troops = st.number_input(f"병력 (가용 {avail:,})", 1, max(1, avail),
+                                     min(10000, max(1, avail)), key="b_n")
             # 장수 1명만(⭐사용자 2026-08-30): 추가 동행은 전투력 0 기여+포획 리스크뿐인 함정 선택지.
             # 장수 재배치는 호송 탭이 전용 동사. AI 경로는 리스트 유지(비대칭 원칙 — 위반 아님).
             gen = st.selectbox("지휘 장수", ["(없음)"] + city.generals, key="b_g",
                                help="부대 전투력 = 병력 × 장수 통솔 보정. 없이도 출격은 가능(보정 없음).")
             strat = st.text_input("전략(50자)", max_chars=50, key="b_s")
-            if st.button("명령 추가", key="b_add", disabled=left <= 0 or target is None):
+            if st.button("명령 추가", key="b_add", disabled=left <= 0 or target is None or avail <= 0):
                 st.session_state.orders.append(Battle(
                     kind="전투", mode="야전" if mode == "출성" else mode, origin=origin,
                     target=target, troops=int(troops),
@@ -257,7 +261,10 @@ def order_builder() -> None:
             origin = st.selectbox("출발", sorted({o for o, _ in pairs}), key="t_o")
             target = st.selectbox("도착", [t for o, t in pairs if o == origin], key="t_t")
             city = s.cities[origin]
-            troops = st.number_input(f"병사 (보유 {city.troops:,})", 0, max(0, city.troops), 0, key="t_n",
+            reserved = sum(getattr(o, "troops", 0) for o in st.session_state.orders
+                           if getattr(o, "origin", None) == origin and o.kind in ("전투", "호송"))
+            t_avail = max(0, city.troops - reserved)
+            troops = st.number_input(f"병사 (가용 {t_avail:,})", 0, t_avail, 0, key="t_n",
                                      help="병사·물자·포로를 실으면 호위 최소 200. 장수 단독은 무호위 가능.")
             gens = st.multiselect("장수", city.generals, key="t_g")
             pris = st.multiselect("포로", city.prisoners, key="t_p")
@@ -445,7 +452,8 @@ def results_screen() -> None:
         st.markdown(f"**{prop.from_faction}의 {detail}**"
                     + (f" · 사신 {prop.envoy}" if prop.envoy else "")
                     + (f"\n\n> {prop.message}" if prop.message else ""))
-        say = st.text_input("답신 한마디(선택 — 상대가 읽고 응수한다)", key=f"say{i}", max_chars=50)
+        say = st.text_input("답신 한마디(선택 — 상대가 읽고 응수한다)", max_chars=50,
+                            key=f"say_{prop.from_faction}_{prop.proposal}_{prop.prisoner}")  # 인덱스 키=텍스트 상속 버그
         c1, c2 = st.columns(2)
         for col, accept in ((c1, True), (c2, False)):
             if col.button("수락" if accept else "거절", key=f"resp{i}_{accept}"):
