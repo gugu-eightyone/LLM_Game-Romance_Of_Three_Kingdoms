@@ -24,8 +24,8 @@ class ParleyReply(BaseModel):
 
 
 class ParleyScore(BaseModel):
-    """담화 심판 채점. 확률 환산은 score_to_chance(코드)."""
-    score: int = Field(ge=1, le=5)
+    """담화 심판 채점(1~10, ⭐10점 통일 — 확률 11%p 간격의 세밀한 맛). 확률 환산은 score_to_chance(코드)."""
+    score: int = Field(ge=1, le=10)
     reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
 
 
@@ -94,8 +94,8 @@ def judge_parley(state: GameState, city: str, prisoner: str,
 
 
 def score_to_chance(score: int) -> float:
-    """채점 1~5 → 설득 확률. 1점=0, 5점=100%. ⭐상한 없음 — 인물 난이도는 심판 채점에 이미 내재(§9-21)."""
-    return (score - 1) / 4
+    """채점 1~10 → 설득 확률(⭐10점 통일). 1점=0, 10점=100%. ⭐상한 없음 — 인물 난이도는 심판 채점에 내재(§9-21)."""
+    return (score - 1) / 9
 
 
 def run_parley(state: GameState, city: str, prisoner: str,
@@ -128,7 +128,7 @@ def run_parley(state: GameState, city: str, prisoner: str,
     verdict = judge_parley(state, city, prisoner, transcript)
     chance = score_to_chance(verdict.score)           # 인물 난이도는 채점에 내재 — 상한 후처리 없음
     if verbose:
-        print(f"[심판] {verdict.score}/5 ({verdict.reason}) → 확률 {chance:.0%}")
+        print(f"[심판] {verdict.score}/10 ({verdict.reason}) → 확률 {chance:.0%}")
     ok = attempt_persuade(state, city, prisoner, chance)
     if verbose:
         print(f"[결과] {'귀순!' if ok else '설득 실패'}")

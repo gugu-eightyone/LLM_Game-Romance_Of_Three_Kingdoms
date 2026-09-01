@@ -11,18 +11,20 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 from .models import (
-    ActiveOperation, Battle, City, Diplomacy, Domestic, GameState, OpCommand, Persuade,
-    Proposal, Scheme, Transfer,
+    ActiveOperation, Battle, City, Diplomacy, Dispose, Domestic, GameState, OpCommand,
+    Persuade, Proposal, Scheme, Transfer,
 )
 
 # 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
 from .config import (
-    ATTRITION_RATE, CAPTURE_FLOOR, CITY_INCOME_FOOD, CITY_INCOME_GOLD,
-    DEFAULT_SPEED, DOMESTIC_GAIN, ESCORT_MIN_TROOPS, TROOPS_PER_FOOD,
+    ALLIANCE_DEFAULT_MONTHS, ATTRITION_RATE, CAPTURE_FLOOR, CITY_INCOME_FOOD, CITY_INCOME_GOLD,
+    DEFAULT_SPEED, DOMESTIC_GAIN, DOMESTIC_MODIFIER_BOUND, ESCORT_MIN_TROOPS,
+    RECRUIT_CURVE_SCALE, STRATEGY_MODIFIER_BOUND, TROOPS_PER_FOOD,
     FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
     MAX_ORDERS_PER_TURN, MORALE_CITY_LOST, MORALE_CITY_TAKEN, MORALE_COMBAT_BAND,
     MORALE_FEAST_CAP, MORALE_RULER_CAPTURED,
@@ -35,6 +37,22 @@ from .config import (
 )
 
 SCENARIO_PATH = Path(__file__).resolve().parent.parent / "data" / "scenario.json"
+
+# 심판 콜백(⭐2026-09-02 judge 배선): (state, faction, kind∈{전투,내정}, 전략문) → (점수 1~5, 사유) | None(실패).
+# LLM 호출은 판단층(decide) 몫 — 엔진은 콜백으로 주입받아 점수→보정 산수만(단방향 유지, 테스트=None이면 결정론 무변).
+JudgeFn = Callable[["GameState", str, str, str], "tuple[int, str] | None"]
+
+
+def _judge_mod(score: int | None, bound: float) -> float:
+    """채점(1~10, 중립=5) → 전투/효율 보정. 비대칭 로그(§9-12): mod = bound×ln(점수/5)/ln(2), 클램프 ±bound.
+
+    ⭐10점 통일(사용자 2026-09-02 — 정수 해상도로 "다양한 맛", 실수형=허위 정밀도라 기각):
+    10=+bound(캡 도달 가능) · 8=+20% · 6=+8% · 5=0(무전략과 동일) · 4=−10% · 3=−22% · 2·1=−bound 급강하
+    (터무니없는 전략=무전략보다 손해, 로그 곡선의 원목적).
+    """
+    if score is None:
+        return 0.0
+    return max(-bound, min(bound, bound * math.log(score / 5) / math.log(2)))
 
 
 # ======================= 로드 =======================
@@ -105,11 +123,12 @@ def _power(state: GameState, troops: int, generals: list[str], morale: int = 50)
 
 
 class Force(NamedTuple):
-    """전투 한 진영의 입력(대칭). 성=wall 보유·야전=wall 0. morale=전투력 배수. 나중 judge 넛지도 여기 필드 추가."""
+    """전투 한 진영의 입력(대칭). 성=wall 보유·야전=wall 0. morale=전투력 배수. mod=전략 심판 보정(⭐배선)."""
     troops: int
     generals: list[str]
     wall: int = 0
     morale: int = 50
+    mod: float = 0.0                              # 전략 채점 보정(±BOUND): 전투력 ×(1+mod). 수성·무전략=0.
 
 
 def _combat_round(state: GameState, a: Force, b: Force) -> tuple[int, int, float]:
@@ -119,8 +138,10 @@ def _combat_round(state: GameState, a: Force, b: Force) -> tuple[int, int, float
     wall은 그 진영 축성 보너스(야전=0). morale=전투력 배수(미지정 50=중립 → 기존 무변).
     성벽은 정원제 — min(wall, 병력/WALL_MANNING)레벨만 위력(빈 성벽 혼자 못 싸움 → 출성 배분 리스크). [[DISCUSSION#9-20]]
     """
-    ap = _power(state, a.troops, a.generals, a.morale) + min(a.wall, a.troops / WALL_MANNING) * WALL_DEFENSE
-    bp = _power(state, b.troops, b.generals, b.morale) + min(b.wall, b.troops / WALL_MANNING) * WALL_DEFENSE
+    ap = _power(state, a.troops, a.generals, a.morale) * (1 + a.mod) \
+        + min(a.wall, a.troops / WALL_MANNING) * WALL_DEFENSE
+    bp = _power(state, b.troops, b.generals, b.morale) * (1 + b.mod) \
+        + min(b.wall, b.troops / WALL_MANNING) * WALL_DEFENSE
     a_loss = min(a.troops, round(bp * ATTRITION_RATE))
     b_loss = min(b.troops, round(ap * ATTRITION_RATE))
     dominance = (ap / bp - 1) if bp > 0 else 999.0
@@ -153,11 +174,29 @@ def _city_threats(state: GameState, city: str, owner: str) -> list[ActiveOperati
 
 
 # ======================= 작전 개시 (검증=평가표면) =======================
-def start_operation(state: GameState, action: Battle,
-                    actor: str | None = None) -> ActiveOperation | None:
+def _judge_strategy(state: GameState, op: ActiveOperation, judge: JudgeFn | None) -> None:
+    """출격·전략변경 시 전투 전략문 채점 → op.strategy_mod(⭐가시화: 점수·사유를 history에 노출).
+
+    라운드마다가 아니라 전략문이 정해질 때 1회(비용). judge 없음(테스트·오프라인)·무전략=보정 0.
+    """
+    text = getattr(op.action, "strategy", "")
+    if judge is None or not text:
+        return
+    verdict = judge(state, op.faction, "전투", text)
+    if verdict is None:                               # 심판 호출 실패 → 보정 없음(공짜 성공/실패 없음)
+        return
+    score, reason = verdict
+    op.strategy_mod = _judge_mod(score, STRATEGY_MODIFIER_BOUND)
+    state.history.append(
+        f"[심판] 작전{op.id} 전략 「{text}」 {score}/10 ({reason}) → 전투 보정 {op.strategy_mod:+.0%}")
+
+
+def start_operation(state: GameState, action: Battle, actor: str | None = None,
+                    judge: JudgeFn | None = None) -> ActiveOperation | None:
     """공성 진군 개시. 출발도시 보유와 대조 → 위반은 클램프+로깅(A·B층 카운트 표면).
 
     actor: 이 행동을 낸 세력. 주면 남의 도시에서 출병시키는 월권을 기각(LLM 경로).
+    judge: 전략 심판 콜백(⭐배선) — 있으면 전략문 채점→전투 보정.
     """
     origin = state.cities.get(action.origin)
     if origin is None:
@@ -234,11 +273,14 @@ def start_operation(state: GameState, action: Battle,
         tag = "·도하" if river else ""
         state.history.append(
             f"[작전{op.id}] {faction} {action.origin}→{action.target} 진군 개시(거리 {dist:g}개월{tag}, 병력 {committed})")
+    _judge_strategy(state, op, judge)                 # ⭐전략 채점(출격 시 1회) → 전투 보정+가시화
     return op
 
 
 # ======================= 내정 (즉시 해소) =======================
-def apply_domestic(state: GameState, action: Domestic, actor: str | None = None) -> None:
+def apply_domestic(state: GameState, action: Domestic, actor: str | None = None,
+                   judge: JudgeFn | None = None) -> None:
+    """내정 집행. ⭐배치4(2026-09-02): 담당 장수(모병=통솔·식량/성벽=지력 배수) + 모병 로그 체감 + 모병 대사 심판."""
     city = state.cities.get(action.city)
     if city is None:
         state.history.append(f"[기각] 내정 도시 '{action.city}' 없음")
@@ -246,34 +288,59 @@ def apply_domestic(state: GameState, action: Domestic, actor: str | None = None)
     if actor is not None and city.owner != actor:
         state.history.append(f"[위반] {actor}가 남의 도시 '{action.city}'({city.owner}) 내정 시도 → 기각")
         return
+    gen = None                                        # ⭐담당 장수: 그 도시 주둔만 유효(무효=제외 로깅, 배수 1.0)
+    if action.general:
+        if action.general in city.generals and action.general in state.generals:
+            gen = state.generals[action.general]
+        else:
+            state.history.append(f"[환각] {city.owner} 내정 담당 '{action.general}' 무효(그 도시 주둔 아님) → 제외")
     spend = min(action.gold_spent, city.gold)
-    if action.item == "성벽보수":                     # ⭐HP화(2026-09-01): 보수=파손 복구(레벨 증축 아님, 만액 상한)
+    if action.item == "성벽보수":                     # ⭐HP화: 보수=파손 복구(레벨 증축 아님, 만액 상한). 지력=금 효율
+        mult = 1 + (gen.intel / GENERAL_SCALE if gen else 0)
         heal_cap = _wall_max(city) - _wall_hp(city)
         if heal_cap <= 0:
             state.history.append(f"[기각] {city.owner} {action.city} 성벽보수 — 성벽이 온전함(파손 없음)")
             return
-        heal = min(heal_cap, spend // WALL_REPAIR_GOLD_PER_HP)
+        use = min(spend, math.ceil(heal_cap * WALL_REPAIR_GOLD_PER_HP / mult))   # 파손분만큼만 과금
+        heal = min(heal_cap, round(use * mult / WALL_REPAIR_GOLD_PER_HP))
         if heal <= 0:
             state.history.append(f"[기각] {city.owner} {action.city} 성벽보수 — 금 부족(HP 1당 금 {WALL_REPAIR_GOLD_PER_HP})")
             return
-        cost = heal * WALL_REPAIR_GOLD_PER_HP         # 파손분만큼만 과금(초과 지출 안 받음)
-        city.gold -= cost
+        city.gold -= use
         city.wall_hp = _wall_hp(city) + heal
         state.history.append(
-            f"[내정] {city.owner} {action.city} 성벽보수 (HP +{heal} → {city.wall_hp}/{_wall_max(city)}, 금 {cost})")
+            f"[내정] {city.owner} {action.city} 성벽보수 (HP +{heal} → {city.wall_hp}/{_wall_max(city)}, 금 {use}"
+            + (f", 담당 {gen.name}" if gen else "") + ")")
         return
     city.gold -= spend
-    if action.item == "식량증산":
-        city.food += spend * DOMESTIC_GAIN
+    note = ""
+    if action.item == "식량증산":                     # 선형 유지 + 지력 배수(⭐모병만 체감 — 문제였던 스노볼이 모병)
+        gained = round(spend * DOMESTIC_GAIN * (1 + (gen.intel / GENERAL_SCALE if gen else 0)))
+        city.food += gained
+        note = f" → 식량 +{gained}"
     elif action.item == "모병":
-        city.troops += spend * DOMESTIC_GAIN
+        # ⭐로그 체감(concave down): 금 도배일수록 효율 저하 — 그 위에 통솔 배수·대사 심판 보정을 얹는다(사용자 확정 구조).
+        base = DOMESTIC_GAIN * RECRUIT_CURVE_SCALE * math.log1p(spend / RECRUIT_CURVE_SCALE)
+        mult = 1 + (gen.command / GENERAL_SCALE if gen else 0)
+        mod = 0.0
+        if judge is not None and action.strategy:
+            verdict = judge(state, city.owner, "내정", action.strategy)
+            if verdict is not None:
+                score, reason = verdict
+                mod = _judge_mod(score, DOMESTIC_MODIFIER_BOUND)
+                state.history.append(
+                    f"[심판] {action.city} 모병 방침 「{action.strategy}」 {score}/10 ({reason}) → 효율 {mod:+.0%}")
+        gained = round(base * mult * (1 + mod))
+        city.troops += gained
+        note = f" → 병력 +{gained}"
     elif action.item == "사기진작":
         f = state.factions.get(city.owner)
         if f and f.morale < MORALE_FEAST_CAP:  # 만찬 천장(⭐금 도배 방지): 그 위 사기는 승리(함락)로만
             f.morale = min(MORALE_FEAST_CAP, f.morale + spend // 500)
         elif f:
-            state.history.append(f"[내정] {city.owner} 사기진작 무효 — 잔치로는 사기 {MORALE_FEAST_CAP} 이상 못 올림")
-    state.history.append(f"[내정] {city.owner} {action.city} {action.item}(금 {spend})")
+            state.history.append(f"[내정] {city.owner} 사기진작 무효 — 잔치로는 사기 {MORALE_FEAST_CAP} 이상 못 올림(금만 소모)")
+    state.history.append(f"[내정] {city.owner} {action.city} {action.item}(금 {spend}"
+                         + (f", 담당 {gen.name}" if gen else "") + f"){note}")
 
 
 # ======================= 호송 (인접 아군 도시 간 자원 이동) =======================
@@ -346,9 +413,10 @@ def start_transfer(state: GameState, action: Transfer, actor: str | None = None)
 
 
 # ======================= 작전지시 (진행 중 작전 제어: 회군·전략변경) =======================
-def apply_op_command(state: GameState, action: OpCommand, actor: str | None = None) -> None:
+def apply_op_command(state: GameState, action: OpCommand, actor: str | None = None,
+                     judge: JudgeFn | None = None) -> None:
     """진행 중 작전에 지시. 회군=즉시 복귀(교전 중=퇴각 손실) → 같은 턴 뒤 명령으로 재출격 가능(=작전 변경).
-    전략변경=전략문 교체(judge 배선 시 교전 보정 입력). 남의 작전=기각."""
+    전략변경=전략문 교체+재채점(⭐judge 배선 — 전황 따라 전술 갱신이 실효). 남의 작전=기각."""
     op = next((o for o in state.operations if o.id == action.op_id), None)
     if op is None:
         state.history.append(f"[기각] 작전지시 대상 작전{action.op_id} 없음")
@@ -367,6 +435,7 @@ def apply_op_command(state: GameState, action: OpCommand, actor: str | None = No
             return
         op.action.strategy = action.strategy
         state.history.append(f"[지시] 작전{op.id} 전략 갱신: {action.strategy}")
+        _judge_strategy(state, op, judge)             # ⭐새 전략 재채점 → 보정 갱신
 
 
 # ======================= 이동 (마일스톤=암묵적, progress로 파생) =======================
@@ -466,7 +535,7 @@ def _siege_round(state: GameState, op: ActiveOperation) -> None:
     dfac = state.factions.get(city.owner)
     atk_loss, def_loss, dominance = _combat_round(
         state,
-        Force(op.committed_troops, op.committed_generals, morale=op.unit_morale),
+        Force(op.committed_troops, op.committed_generals, morale=op.unit_morale, mod=op.strategy_mod),
         Force(city.troops, city.generals, wall=city.wall, morale=dfac.morale if dfac else 50))
     if op.prep > 0:                                   # 조기도착 준비이점: 캡 씌운 결정론 1회 보정
         dominance += min(PREP_CAP, op.prep * PREP_RATE)
@@ -540,6 +609,8 @@ def _capture_city(state: GameState, op: ActiveOperation, city) -> None:
         if not remaining:                            # 전 도시 상실 → 세력 소멸
             lf.alive = False
             state.alliances = [p for p in state.alliances if loser not in p]      # 망국의 동맹·제안 자동 소멸
+            state.alliance_expires = {k: v for k, v in state.alliance_expires.items()
+                                      if loser not in k.split("|")}
             state.proposals = [p for p in state.proposals if loser not in (p.from_faction, p.to_faction)]
             # ⭐2026-09-01 좀비 세력 차단: 망국의 잔존 출전 부대는 정복 세력에 투항(마지막 함락 도시로 흡수).
             # 투항 장수만 승자 소속 전환 — 타지 수감 포로 등은 원 소속 유지(망국 인재 설득 개방 §9-21⑤ 보존).
@@ -631,8 +702,8 @@ def _field_round(state: GameState, a: ActiveOperation, b: ActiveOperation,
     """
     a_loss, b_loss, _ = _combat_round(
         state,
-        Force(a.committed_troops, a.committed_generals, morale=a.unit_morale),
-        Force(b.committed_troops, b.committed_generals, morale=b.unit_morale))
+        Force(a.committed_troops, a.committed_generals, morale=a.unit_morale, mod=a.strategy_mod),
+        Force(b.committed_troops, b.committed_generals, morale=b.unit_morale, mod=b.strategy_mod))
     a.committed_troops -= a_loss
     b.committed_troops -= b_loss
     a.unit_morale = max(0, a.unit_morale - UNIT_MORALE_COMBAT_DROP)
@@ -970,6 +1041,7 @@ def apply_diplomacy(state: GameState, action: Diplomacy, actor: str | None = Non
         pair = tuple(sorted((me, t)))
         if pair in state.alliances:
             state.alliances.remove(pair)
+            state.alliance_expires.pop("|".join(pair), None)
             _chronicle(state, f"{me}, {t}와의 동맹 파기")
         else:
             state.history.append(f"[환각] {me}, 동맹 아닌 {t}에 파기 선언 → 기각")
@@ -1008,16 +1080,16 @@ def apply_diplomacy(state: GameState, action: Diplomacy, actor: str | None = Non
         state.history.append(f"[외교] {me}, {t}에 항복 권유")
         return
 
-    # 동맹 제안
-    if allied(state, me, t):
-        state.history.append(f"[환각] {me}-{t} 이미 동맹인데 재제안 → 기각")
-        return
+    # 동맹 제안 — ⭐기한제(2026-09-02): 동맹 중 재제안 = 연장 제안(구 [환각] 기각 폐기)
+    months = action.months if action.months > 0 else ALLIANCE_DEFAULT_MONTHS
     if any(p.proposal == "동맹" and {p.from_faction, p.to_faction} == {me, t} for p in state.proposals):
         state.history.append(f"[기각] {me}-{t} 동맹 제안 중복")
         return
-    state.proposals.append(Proposal(from_faction=me, to_faction=t, proposal="동맹",
+    extend = allied(state, me, t)
+    state.proposals.append(Proposal(from_faction=me, to_faction=t, proposal="동맹", months=months,
                                     envoy=envoy, message=action.message))
-    state.history.append(f"[외교] {me}, {t}에 동맹 제안" + (f" (사신 {envoy})" if envoy else ""))
+    state.history.append(f"[외교] {me}, {t}에 동맹 {'연장' if extend else ''} 제안({months}개월)"
+                         + (f" (사신 {envoy})" if envoy else ""))
 
 
 def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str = "") -> bool:
@@ -1034,9 +1106,13 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
         return False
     if prop.proposal == "동맹":
         pair = tuple(sorted((a, b)))
+        months = prop.months if prop.months > 0 else ALLIANCE_DEFAULT_MONTHS
         if pair not in state.alliances:
             state.alliances.append(pair)
-            _chronicle(state, f"{pair[0]}-{pair[1]} 동맹 체결")
+            _chronicle(state, f"{pair[0]}-{pair[1]} 동맹 체결({months}개월)")
+        else:                                          # ⭐연장 수락 = 잔여 기한 재설정
+            _chronicle(state, f"{pair[0]}-{pair[1]} 동맹 연장({months}개월)")
+        state.alliance_expires["|".join(pair)] = months
         return True
     if prop.proposal == "항복권유":                   # 수락 = b가 a에 항복(전 도시·군대·장수 헌납)
         lf = state.factions.get(b)
@@ -1063,6 +1139,8 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
             _liberate_prisoners(state, c)
         lf.alive = False
         state.alliances = [p for p in state.alliances if b not in p]
+        state.alliance_expires = {k: v for k, v in state.alliance_expires.items()
+                                  if b not in k.split("|")}
         state.proposals = [p for p in state.proposals if b not in (p.from_faction, p.to_faction)]
         _chronicle(state, f"{b}, {a}에 항복 (전 도시 헌납)")
         check_victory(state)
@@ -1121,33 +1199,41 @@ def check_victory(state: GameState) -> None:
 
 
 # ======================= 턴 오케스트레이션 =======================
-def _dispatch(state: GameState, action, actor: str | None = None) -> None:
+def _dispatch(state: GameState, action, actor: str | None = None,
+              judge: JudgeFn | None = None) -> None:
     if isinstance(action, Domestic):
-        apply_domestic(state, action, actor)
+        apply_domestic(state, action, actor, judge)
     elif isinstance(action, Battle):
-        start_operation(state, action, actor)        # 공성·야전 모두 진군 작전으로 개시
+        start_operation(state, action, actor, judge)  # 공성·야전 모두 진군 작전으로 개시
     elif isinstance(action, Transfer):
         start_transfer(state, action, actor)
     elif isinstance(action, OpCommand):
-        apply_op_command(state, action, actor)
+        apply_op_command(state, action, actor, judge)
     elif isinstance(action, Diplomacy):
         apply_diplomacy(state, action, actor)
     elif isinstance(action, Persuade):
         apply_persuade(state, action, actor)
+    elif isinstance(action, Dispose):                 # ⭐수감 포로 후속 처분(석방/처형) — 행동 턴 명령
+        c = state.cities.get(action.city)
+        if c is None or (actor is not None and c.owner != actor):
+            state.history.append(f"[위반] {actor} 처분 월권/무효 도시 '{action.city}' → 기각")
+        else:
+            apply_disposition(state, action.city, action.prisoner, action.choice)
     elif isinstance(action, Scheme):
         state.history.append(f"[증분2] 계략({action.scheme_type}) 미구현 → 무시")
 
 
 def _order_phase(action) -> int:
-    """명령 카테고리(⭐2026-09-01 phase 확정): 0=외교 → 1=전투(출격·작전지시·호송) → 2=내정(내정·설득·계략)."""
+    """명령 카테고리(⭐2026-09-01 phase 확정): 0=외교 → 1=전투(출격·작전지시·호송) → 2=내정(내정·설득·처분·계략)."""
     if isinstance(action, Diplomacy):
         return 0
-    if isinstance(action, (Domestic, Persuade, Scheme)):
+    if isinstance(action, (Domestic, Persuade, Dispose, Scheme)):
         return 2
     return 1
 
 
-def advance_turn(state: GameState, actions: list | dict) -> None:
+def advance_turn(state: GameState, actions: list | dict,
+                 judge: JudgeFn | None = None) -> None:
     """한 달 진행: 개시/내정 → 이동(마일스톤) → 전투 해소(야전·공성·퇴각·포로) → 승리 → 시간.
 
     actions: `{세력: Action | list[Action]}` dict면 행위자 소유권 검증 + 명령 상한(LLM 경로),
@@ -1176,7 +1262,7 @@ def advance_turn(state: GameState, actions: list | dict) -> None:
         items = [(None, a) for a in actions]
     owners0 = {n: c.owner for n, c in state.cities.items()}   # 점령 회복 판정용 스냅샷(⭐사용자)
     for actor, a in items:
-        _dispatch(state, a, actor)
+        _dispatch(state, a, actor, judge)
     _advance_movement(state)                          # 이동중 작전 진행(필드 교전=고정)
     _resolve_combat(state)                            # 야전 쌍 → 공성 → 종료 판정
     _economy_tick(state)                              # 수입·병량(턴 말 — 다음 brief가 갱신값을 봄)
@@ -1189,6 +1275,15 @@ def advance_turn(state: GameState, actions: list | dict) -> None:
         if healed != _wall_hp(c):
             c.wall_hp = healed
             state.history.append(f"[점령] {n} 성벽 응급 보수 → {healed}/{m}")
+    for key in list(state.alliance_expires):          # ⭐동맹 기한 틱: 만료=명예 종료(파기와 구분되는 연혁)
+        state.alliance_expires[key] -= 1
+        if state.alliance_expires[key] <= 0:
+            del state.alliance_expires[key]
+            a2, b2 = key.split("|")
+            pair = tuple(sorted((a2, b2)))
+            if pair in state.alliances:
+                state.alliances.remove(pair)
+                _chronicle(state, f"{pair[0]}-{pair[1]} 동맹 만료(기한 종료)")
     check_victory(state)
     state.month += 1
     if state.month > 12:

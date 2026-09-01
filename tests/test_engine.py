@@ -137,11 +137,20 @@ def test_defender_escapes_or_captured_not_vanish():
     assert "장료" not in s.cities["A"].generals      # 접수 후 A 주둔 = 공격군만
 
 
-def test_domestic_recruit_deducts_gold():
+def test_domestic_recruit_log_curve():
+    """⭐모병 로그 체감(배치4): 병력 = GAIN×SCALE×ln(1+금/SCALE) — 소액≈선형, 도배=효율 급감."""
+    import math
+    from src.config import DOMESTIC_GAIN, RECRUIT_CURVE_SCALE
     s = _mini_state()
     apply_domestic(s, Domestic(kind="내정", city="성도", item="모병", gold_spent=1000))
-    assert s.cities["성도"].troops == 10000 + 1000 * 2   # 금 1당 병력 2
+    expect = round(DOMESTIC_GAIN * RECRUIT_CURVE_SCALE * math.log1p(1000 / RECRUIT_CURVE_SCALE))
+    assert s.cities["성도"].troops == 10000 + expect     # 1000금 → 1823 (선형 2000의 91%)
     assert s.cities["성도"].gold == 5000 - 1000
+    # 큰돈일수록 금당 효율 감소(concave down)
+    s2 = _mini_state()
+    apply_domestic(s2, Domestic(kind="내정", city="성도", item="모병", gold_spent=5000))
+    big = s2.cities["성도"].troops - 10000
+    assert big < expect * 5                              # 5배 투입 < 5배 병력
 
 
 def test_domestic_wall_repair_heals_damage_only():

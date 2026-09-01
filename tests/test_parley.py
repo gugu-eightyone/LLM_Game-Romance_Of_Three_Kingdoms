@@ -206,11 +206,11 @@ def test_resolve_dispositions_holds_on_llm_failure(monkeypatch):
 
 # ---------- 플레이어 담화 루프(parley) ----------
 def test_score_to_chance_no_cap():
-    """⭐상한 없음: 인물 난이도는 심판 채점에 내재(만점=100%)."""
+    """⭐상한 없음: 인물 난이도는 심판 채점에 내재(만점=100%). ⭐10점 통일: 11%p 간격."""
     from src.parley import score_to_chance
     assert score_to_chance(1) == 0.0
-    assert score_to_chance(3) == 0.5
-    assert score_to_chance(5) == 1.0
+    assert score_to_chance(4) == 3 / 9
+    assert score_to_chance(10) == 1.0
 
 
 def test_run_parley_headless(monkeypatch):
@@ -221,7 +221,7 @@ def test_run_parley_headless(monkeypatch):
             return parley.ParleyReply(text="…그 말이 맞을지도 모르오.")
         return parley.ParleyScore(score=5, reason="처지에 와닿는 설득")
     monkeypatch.setattr(parley, "structured_complete", fake)
-    s = _state(seed=1)                                 # 첫 난수 ≈0.134 < 0.6
+    s = _state(seed=1)                                 # 첫 난수 ≈0.134 < 0.444(5/10점)
     ok = parley.run_parley(s, "수춘", "감녕", player_lines=["오의 대세는 기울었소"], verbose=False)
     assert ok and "감녕" in s.cities["수춘"].generals
 

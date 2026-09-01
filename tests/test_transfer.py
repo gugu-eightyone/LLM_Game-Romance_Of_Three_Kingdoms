@@ -94,7 +94,10 @@ def test_recruit_not_usable_same_turn():
         Battle(kind="전투", mode="공성", origin="성도", target="업", troops=12000),
     ]})
     assert any("[환각]" in h and "과투입" in h for h in s.history)   # 전투 시점 보유 10000 → 클램프
-    assert s.cities["성도"].troops == 0 + 1000 * 2          # 전량 출격 후 모병 2000이 다음 달 몫으로 남음
+    import math
+    from src.config import DOMESTIC_GAIN, RECRUIT_CURVE_SCALE
+    expect = round(DOMESTIC_GAIN * RECRUIT_CURVE_SCALE * math.log1p(1000 / RECRUIT_CURVE_SCALE))
+    assert s.cities["성도"].troops == expect                # 전량 출격 후 모병분(로그 체감)이 다음 달 몫
 
 
 def test_dest_captured_mid_transit_returns_home():

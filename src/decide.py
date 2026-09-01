@@ -30,6 +30,33 @@ class Decision(BaseModel):
 SYSTEM = load_prompt("decide_system")
 
 
+# ======================= 특화 심판 (⭐2026-09-02 배선 — §9-11 kind 라우팅) =======================
+class JudgeScore(BaseModel):
+    """전략/방침 채점(1~10, 중립=5 — ⭐10점 통일). 확률·보정 환산은 엔진(_judge_mod) — 심판은 점수만(캡·산수=코드)."""
+    score: int = Field(ge=1, le=10)
+    reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
+
+
+JUDGE_SYSTEMS = {"전투": load_prompt("strategy_judge"), "내정": load_prompt("domestic_judge")}
+
+
+def action_judge(state: GameState, faction: str, kind: str, text: str) -> tuple[int, str] | None:
+    """엔진에 주입하는 심판 콜백(§9-11: kind로 코드 라우팅 → 도메인 특화 심판, 분류 LLM 없음).
+
+    채점 근거=정세 브리핑(상태 정합성 채점 → 미사여구 gaming 방어, §9-12). 실패=None(보정 0, 공짜 없음).
+    """
+    system = JUDGE_SYSTEMS.get(kind)
+    if system is None:
+        return None
+    try:
+        v = structured_complete(
+            JudgeScore, system.format(faction=faction),
+            brief(state, faction) + f"\n\n[채점 대상 {kind} 전략] {text}")
+        return v.score, v.reason
+    except LLMError:
+        return None
+
+
 def _city_line(state: GameState, name: str, own: bool) -> str:
     c = state.cities[name]
     # 병0 도시는 "출병 불가"를 글자로 박음(잔여 병력 대조를 mini에게 추론시키지 않기)
@@ -70,7 +97,11 @@ def brief(state: GameState, faction: FactionName) -> str:
     mine = [n for n, c in state.cities.items() if c.owner == faction]
     other = [n for n, c in state.cities.items() if c.owner != faction]
     captive = any(f.ruler in c.prisoners for c in state.cities.values())   # 군주 피랍(승계 보류 중, §9-21)
-    allies = sorted({x for pair in state.alliances if faction in pair for x in pair} - {faction})
+    def _ally_tag(x: str) -> str:                     # 기한제(⭐): 잔여 개월 표기, 엔트리 없으면 무기한
+        left = state.alliance_expires.get("|".join(sorted((faction, x))))
+        return f"{x}({left}개월)" if left else x
+    allies = [_ally_tag(x) for x in
+              sorted({x for pair in state.alliances if faction in pair for x in pair} - {faction})]
     lines = [f"[{state.year}년 {state.month}월] 우리={faction}, 군주={f.ruler}"
              + ("(적에게 피랍!)" if captive else "") + f", 사기={f.morale}"
              + (f", 동맹={','.join(allies)}" if allies else ""),
@@ -85,6 +116,7 @@ def brief(state: GameState, faction: FactionName) -> str:
                   + (f" 교전 중" if o.stage == "교전"     # 공성 게이지=도시 줄의 성벽 파손 표기(HP화)
                      else f" 이동 {o.progress:g}/{o.threshold:g}")
                   + f" 병력{o.committed_troops} 사기{o.unit_morale}"
+                  + (f" 전략보정{o.strategy_mod:+.0%}" if o.strategy_mod else "")
                   + (f" 장수 {','.join(o.committed_generals)}(출전 중)" if o.committed_generals else "")
                   + (" ← 아군: 자동 계속. 이 작전에 새 출격을 또 내리지 마라(별도 부대가 추가로 나간다) — 변경·철수는 작전지시로"
                      if o.faction == faction else "")
@@ -181,7 +213,8 @@ PROPOSAL_SYSTEM = load_prompt("proposal_response")
 
 def decide_proposal_response(state: GameState, prop) -> ProposalResponse | None:
     """제안받은 세력 군주 LLM에 수락/거절 질의(소호출). 실패 시 None=보류(제안 잔존, 다음 턴 재질의)."""
-    detail = (f"[제안] {prop.from_faction}의 동맹 제안" if prop.proposal == "동맹"
+    detail = (f"[제안] {prop.from_faction}의 동맹 제안(기한 {prop.months or 12}개월"
+              f" — 이미 동맹이면 연장 제안)" if prop.proposal == "동맹"
               else f"[제안] {prop.from_faction}의 항복 권유 — 수락하면 우리의 전부를 넘기고 나라를 접는다"
               if prop.proposal == "항복권유"
               else f"[제안] {prop.from_faction}의 포로 {prop.prisoner} 반환 요청"
@@ -254,7 +287,7 @@ def demo(turns: int = 6) -> None:
         for f, acts in actions.items():
             for a in acts:
                 print(f"  {f}: {a.model_dump_json(exclude_defaults=True)}")
-        advance_turn(state, actions)
+        advance_turn(state, actions, judge=action_judge)   # ⭐전략·모병 심판 배선(스모크=실 채점)
         resolve_dispositions(state, verbose=True)    # 포획 포로 즉결 처분(§9-21)
         resolve_proposals(state, verbose=True)       # 외교 제안 응답(§9-22)
         print(f"[{state.year}년 {state.month}월 종료]")

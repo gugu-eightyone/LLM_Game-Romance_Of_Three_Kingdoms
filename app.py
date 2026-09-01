@@ -15,12 +15,12 @@ import streamlit as st
 from pydantic import BaseModel, Field
 
 from src.config import MAX_ORDERS_PER_TURN, PARLEY_MAX_ROUNDS
-from src.decide import brief, decide, resolve_dispositions, resolve_proposals
+from src.decide import action_judge, brief, decide, resolve_dispositions, resolve_proposals
 from src.engine import (_city_threats, _wall_hp, _wall_max, advance_turn, allied,
                         apply_disposition, attempt_persuade, load_scenario,
                         respond_proposal, surrender_gate)
 from src.llm import LLMError, structured_complete
-from src.models import Battle, Diplomacy, Domestic, GameState, OpCommand, Transfer
+from src.models import Battle, Diplomacy, Dispose, Domestic, GameState, OpCommand, Transfer
 from src.parley import (ParleyReply, _fallen, judge_parley, prisoner_reply,
                         score_to_chance)
 from src.prompts import load as load_prompt
@@ -94,7 +94,8 @@ def end_turn() -> None:
                 a = decide(s, name)
             if a:
                 actions[name] = a
-    advance_turn(s, actions)
+    with st.spinner("심판이 전략을 채점하고 전투가 벌어진다..."):
+        advance_turn(s, actions, judge=action_judge)   # ⭐전략·모병 심판 배선(플레이어 전략도 채점=가시화)
     with st.spinner("전후 처리(포로·외교)..."):
         resolve_dispositions(s, player=player)        # 플레이어 몫은 큐 잔존 → 결과 창이 소비
         resolve_proposals(s, player=player)
@@ -167,6 +168,7 @@ def state_panel() -> None:
                      else f"이동 {o.progress:g}/{o.threshold:g}개월")
             st.text(f"[{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"
                     f" · {phase} · 병력 {o.committed_troops} · 사기 {o.unit_morale}"
+                    + (f" · 전략보정 {o.strategy_mod:+.0%}" if o.strategy_mod else "")
                     + (f" · 장수 {','.join(o.committed_generals)}" if o.committed_generals else ""))
     with st.expander("주요 연혁"):
         st.text("\n".join(s.chronicle) or "(아직 없음)")
@@ -231,12 +233,20 @@ def order_builder() -> None:
         item = st.radio("항목", ["식량증산", "모병", "사기진작", "성벽보수"], horizontal=True, key="d_i")
         gold = st.number_input(f"투입 금 (보유 {s.cities[city_n].gold:,})",
                                0, max(0, s.cities[city_n].gold), 0, key="d_g",
-                               help="금 1 → 식량/병력 2 전환. 성벽보수 = 파손된 성벽 HP 복구(금 3당 1, 온전하면 기각). "
-                                    "사기진작은 사기 80까지만(금 500당 1).")
-        strat = st.text_input("방침(50자, 서사)", max_chars=50, key="d_s")
+                               help="식량증산: 금 1→2. 모병: 금이 클수록 효율이 로그로 감소(도배 비추). "
+                                    "성벽보수 = 파손 HP 복구(금 3당 1, 온전하면 기각). 사기진작은 80까지만(그 이상=금만 소모).")
+        # ⭐담당 장수: 모병=통솔·식량/성벽=지력 비례 효율(안내 한 세트 — 사용자 확정)
+        overseer = st.selectbox("담당 장수(선택)", ["(없음)"] + s.cities[city_n].generals, key="d_gen",
+                                help="모병=통솔, 식량증산·성벽보수=지력에 비례해 효율 상승. 사기진작은 무관.")
+        strat = ""
+        if item == "모병":
+            strat = st.text_input("모병 방침(50자 — 심판이 채점해 효율 ±30%)", max_chars=50, key="d_s")
+        elif item == "사기진작":
+            strat = st.text_input("잔치 한마디(50자, 서사)", max_chars=50, key="d_s2")
         if st.button("명령 추가", key="d_add", disabled=left <= 0):
             st.session_state.orders.append(Domestic(
-                kind="내정", city=city_n, item=item, gold_spent=int(gold), strategy=strat))
+                kind="내정", city=city_n, item=item, gold_spent=int(gold),
+                general="" if overseer == "(없음)" else overseer, strategy=strat))
             st.rerun()
 
     with tabs[2]:                                     # 호송: 인접 아군 도시만(위젯이 걸러줌)
@@ -281,7 +291,7 @@ def order_builder() -> None:
             st.caption("남은 세력이 없다.")
         else:
             t = st.selectbox("상대", others, key="dp_t")
-            opts = ["파기"] if allied(s, player, t) else ["동맹"]
+            opts = ["연장", "파기"] if allied(s, player, t) else ["동맹"]   # ⭐기한제: 동맹 중=연장 제안 가능
             my_captured = [p for c in s.cities.values() if c.owner == t
                            for p in c.prisoners if s.generals.get(p) and s.generals[p].faction == player]
             if my_captured:
@@ -289,6 +299,12 @@ def order_builder() -> None:
             if surrender_gate(s, player, t):          # 게이트: 상대 도시 ≤2 + 국력 우위(엔진과 공유)
                 opts.append("항복권유")
             prop = st.radio("제안", opts, horizontal=True, key="dp_p")
+            months = 0
+            if prop in ("동맹", "연장"):
+                left_m = s.alliance_expires.get("|".join(sorted((player, t))))
+                months = st.number_input("기한(개월)" + (f" — 현재 잔여 {left_m}개월" if left_m else ""),
+                                         1, 60, 12, key="dp_mo",
+                                         help="만료=자동 해소(명예 종료, 배신 아님). 연장 수락 시 이 기한으로 재설정.")
             prisoner, og, of = "", 0, 0
             if prop == "포로반환":
                 prisoner = st.selectbox("되찾을 장수", my_captured, key="dp_pr")
@@ -303,18 +319,20 @@ def order_builder() -> None:
                 msg = st.text_input("국서(50자)", max_chars=50, key="dp_m")
             if st.button("명령 추가", key="dp_add", disabled=left <= 0):
                 st.session_state.orders.append(Diplomacy(
-                    kind="외교", target_faction=t, proposal=prop, prisoner=prisoner,
+                    kind="외교", target_faction=t,
+                    proposal="동맹" if prop == "연장" else prop,   # 연장=동맹 재제안(엔진 규약)
+                    months=int(months), prisoner=prisoner,
                     offer_gold=int(og), offer_food=int(of), envoy=envoy, message=msg))
                 st.rerun()
 
-    # 포로 담화(설득) — 명령 슬롯을 즉시 소모하는 인터랙티브 시도(§9-21)
+    # 포로 담화(설득)·후속 처분 — 담화=슬롯 즉시 소모(§9-21), 석방/처형=처분 명령(⭐배치4)
     held = [(c.name, p) for c in s.cities.values() if c.owner == player for p in c.prisoners]
     if held:
-        st.markdown("**수감 중인 포로** — 담화로 설득 시도(명령 1 소모)")
+        st.markdown("**수감 중인 포로** — 담화(설득, 명령 1 소모) / 석방·처형(처분 명령 추가)")
         for city_n, p in held:
             g = s.generals.get(p)
             locked = g is not None and g.is_ruler and not _fallen(s, g)
-            c1, c2 = st.columns([4, 1])
+            c1, c2, c3, c4 = st.columns([4, 1, 1, 1])
             c1.text(f"{p} ({city_n} 수감, 원 소속 {g.faction if g else '미상'})"
                     + (" — 현직 군주: 설득 불가" if locked else ""))
             if c2.button("담화", key=f"par_{city_n}_{p}", disabled=locked or left <= 0):
@@ -322,6 +340,11 @@ def order_builder() -> None:
                                            "transcript": [], "verdict": None}
                 st.session_state.mode = "parley"
                 st.rerun()
+            for col, choice in ((c3, "석방"), (c4, "처형")):
+                if col.button(choice, key=f"disp2_{city_n}_{p}_{choice}", disabled=left <= 0):
+                    st.session_state.orders.append(Dispose(
+                        kind="처분", city=city_n, prisoner=p, choice=choice))
+                    st.rerun()
 
     st.divider()
     if st.button("🏁 턴 종료(이대로 진행)", type="primary"):
@@ -362,7 +385,7 @@ def parley_screen() -> None:
             st.rerun()
     else:
         v, chance, ok = ctx["verdict"]
-        st.info(f"심판 {v.score}/5 ({v.reason}) → 확률 {chance:.0%}")
+        st.info(f"심판 {v.score}/10 ({v.reason}) → 확률 {chance:.0%}")
         (st.success if ok else st.warning)("귀순!" if ok else "설득 실패 — 포로는 마음을 닫았다.")
         if st.button("돌아가기"):
             st.session_state.mode = "play"

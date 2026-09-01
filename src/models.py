@@ -69,6 +69,8 @@ class ActiveOperation(BaseModel):
     committed_troops: int = 0                     # 검증·클램프된 실제 투입
     committed_generals: list[str] = Field(default_factory=list)  # 검증된 동행 장수
     unit_morale: int = 50                         # 부대 사기: 출전 시 전역 사기 복사→독립. 전투력 배수·매교전 소량 감소. [[DISCUSSION#9-10]]
+    strategy_mod: float = 0.0                     # ⭐전략 심판 보정(2026-09-02 배선): 채점→±BOUND, 전투력 배수(1+mod).
+                                                  # 출격·전략변경 시 채점(라운드마다 아님=비용), judge 없으면 0=결정론 무변.
     has_fought: bool = False                      # 야전 교전 1회+ 경험. True인 야전 op는 상대 소멸 시 출격 종료→복귀(공성은 임무 재개). [[DISCUSSION#9-10]]
     # --- 호송 화물(호송 op만 사용, 전투 op는 전부 0/빈) ---
     cargo_gold: int = 0
@@ -90,6 +92,8 @@ class GameState(BaseModel):
     # --- 진행/결과 ---
     next_op_id: int = 1                          # 작전 id 발급 카운터
     alliances: list[tuple[str, str]] = Field(default_factory=list)  # 동맹 쌍(정렬 튜플로 정규화). 효과=안 싸움+구원, 파기 즉시. [[DISCUSSION#9-22]]
+    alliance_expires: dict[str, int] = Field(default_factory=dict)  # ⭐기한제(2026-09-02): "a|b"(정렬)→잔여 개월.
+                                                  # 엔트리 없는 쌍=무기한(구 세이브·테스트 하위호환). 0 도달=만료(명예 종료, 파기와 구분).
     pending_captives: list[tuple[str, str]] = Field(default_factory=list)  # 신규 포획 (도시, 장수) — 즉결 처분 질의는 포획 시 1회만(수감 후엔 설득 명령·몸값 영역)
     proposals: list[Proposal] = Field(default_factory=list)         # 대기 외교 제안 큐(턴 해소 후 상대 군주 질의로 소진)
     winner: FactionName | None = None            # 승리 판정 결과(None=진행 중)
@@ -137,7 +141,10 @@ class Domestic(BaseModel):
     city: str                                    # 자국 도시
     item: Literal["식량증산", "모병", "사기진작", "성벽보수"]
     gold_spent: int = 0                           # 투입병력·대상적 없음
-    strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)  # 표현만 자연어(효과는 item+gold 결정론). 심판 채점 재료.
+    general: str = ""                             # ⭐담당 장수(2026-09-02): 모병=통솔·식량증산/성벽보수=지력 비례 효율.
+                                                  # 그 도시 주둔 장수만(무효=제외 로깅), 미지정=배수 1.0.
+    strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)  # ⭐모병=내정 심판 채점→효율 ±30% / 사기진작=서사.
+                                                  # 식량증산·성벽보수는 대사 생략(⭐컷).
 
 
 class OpCommand(BaseModel):
@@ -172,6 +179,7 @@ class Diplomacy(BaseModel):
     kind: Literal["외교"]
     target_faction: FactionName
     proposal: Literal["동맹", "파기", "포로반환", "항복권유"]
+    months: int = 0                              # ⭐동맹 기한(개월, 2026-09-02). 0=기본값(config). 동맹 중 재제안=연장.
     prisoner: str = ""                           # 포로반환: 되사올 우리 장수
     offer_gold: int = 0                          # 포로반환 몸값(금)
     offer_food: int = 0                          # 포로반환 몸값(식량)
@@ -184,11 +192,23 @@ class Proposal(BaseModel):
     from_faction: str
     to_faction: str
     proposal: str = "동맹"
+    months: int = 0                              # 동맹/연장 기한(개월). 0=기본값.
     prisoner: str = ""
     offer_gold: int = 0
     offer_food: int = 0
     envoy: str = ""
     message: str = ""
+
+
+class Dispose(BaseModel):
+    """수감 포로 후속 처분(⭐2026-09-02): 석방/처형을 행동 턴 명령으로 — 즉결(포획 시 1회) 이후의 정리 경로.
+
+    석방의 보상 = 연혁 기록뿐(은혜 서사, 기계 보너스 없음 — ⭐"다른 건 건들지 마"). 수감은 무의미라 제외.
+    """
+    kind: Literal["처분"]
+    city: str                                    # 포로가 수감된 우리 도시
+    prisoner: str
+    choice: Literal["석방", "처형"]
 
 
 class Transfer(BaseModel):
@@ -211,7 +231,7 @@ class Transfer(BaseModel):
 # pydantic이 `oneOf`를 내고 → OpenAI 구조화출력이 이를 거부(anyOf만 허용, 스모크로 확인).
 # 세 변형의 `kind` 리터럴이 서로 겹치지 않아 discriminator 없는 평범한 Union으로도
 # 판별이 정확·유일함(잘못된 조합은 그대로 거부). → anyOf로 나가 OpenAI 통과.
-Action = Union[Battle, Scheme, Domestic, Transfer, OpCommand, Diplomacy, Persuade]
+Action = Union[Battle, Scheme, Domestic, Transfer, OpCommand, Diplomacy, Persuade, Dispose]
 ActionAdapter = TypeAdapter(Action)              # dict → 올바른 변형으로 파싱·검증
 
 
