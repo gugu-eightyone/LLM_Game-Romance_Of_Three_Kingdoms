@@ -74,8 +74,11 @@ def _chronicle(state: GameState, event: str) -> None:
     """주요 연혁 기록 — brief가 전량 노출(영구). 굵직한 사건만: 함락·군주 포획/승계·멸망·통일.
 
     LLM 요약 대신 결정론 기록(누락 0·호출 0). 원한·복수 같은 해석은 LLM 역할극 몫.
+    턴 로그(history)에도 [연혁] 태그로 남긴다 — 파기·체결 등이 연혁에만 적혀 관전·플레이어
+    눈에 무로그였던 구멍의 단일 수리 지점(함락 등 일부 사건은 상세 로그와 중복되나 허용, ⭐2026-09-02).
     """
     state.chronicle.append(f"{state.year}년 {state.month}월: {event}")
+    state.history.append(f"[연혁] {event}")
 
 
 # ======================= 지형 =======================

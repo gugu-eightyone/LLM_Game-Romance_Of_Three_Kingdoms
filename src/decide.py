@@ -11,13 +11,14 @@
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from .config import FOOD_ALERT_MONTHS, SIEGE_BASE, STRATEGY_MAX_CHARS, WALL_HP_SCALE
 from .llm import LLMError, structured_complete
-from .models import Action, Domestic, FactionName, GameState
+from .models import (Action, Battle, Diplomacy, Dispose, Domestic, FactionName,
+                     GameState, OpCommand, Persuade, Scheme, Transfer)
 from .prompts import load as load_prompt
 
 
@@ -139,13 +140,41 @@ def _fallback(state: GameState, faction: FactionName) -> Decision | None:
     return Decision(actions=[Domestic(kind="내정", city=mine[0], item="식량증산", gold_spent=0)])
 
 
+def _decision_model(state: GameState, faction: FactionName) -> type[Decision]:
+    """⭐동적 스키마(2026-09-02): 장수 필드 2곳(출격 동행·내정 담당)을 도시-장수 쌍 variant로 제약.
+
+    "그 도시에 있는 장수만"은 관계 제약이라 단일 enum으론 못 막는다 → 자국 도시별로
+    (origin/city=Literal[도시], 장수=Literal[그 도시 주둔진]) variant를 만들어 anyOf로 묶는다.
+    티칭 2회 실패(스모크 1.17/턴 → 강화 후 장기런 1.56/턴) 후 승격한 최후 카드 —
+    측정된 실패 지점 2곳만. 나머지 동사는 정적 스키마+엔진 가드 유지(A층 측정 표면 보존).
+    엔진 가드도 그대로 산다(플레이어·list 경로, 스키마가 놓치는 턴중 이동은 어차피 동시판정이라 없음).
+    """
+    battles: list[type[BaseModel]] = []
+    doms: list[type[BaseModel]] = []
+    for i, (name, c) in enumerate(state.cities.items()):
+        if c.owner != faction:
+            continue
+        b_fields: dict = {"origin": (Literal[name], ...)}
+        if c.generals:                               # 장수 없는 도시 = 제약할 목록이 없음(가드가 수비)
+            b_fields["generals"] = (list[Literal[tuple(c.generals)]], Field(default_factory=list))
+        battles.append(create_model(f"Battle{i}", __base__=Battle, **b_fields))
+        doms.append(create_model(
+            f"Domestic{i}", __base__=Domestic,
+            city=(Literal[name], ...),
+            general=(Literal[tuple(c.generals) + ("",)], ""),   # ""=미지정(배수 1.0)
+        ))
+    union = Union[tuple(battles + doms) + (Scheme, Transfer, OpCommand, Diplomacy, Persuade, Dispose)]
+    return create_model("DynDecision", __base__=Decision, actions=(list[union], ...))
+
+
 def decide(state: GameState, faction: FactionName) -> list[Action] | None:
     """한 세력의 이번 달 명령 목록. 도시가 없으면 None(행동할 주체가 없음)."""
     fb = _fallback(state, faction)
     if fb is None:
         return None
     return structured_complete(
-        Decision, SYSTEM.format(faction=faction), brief(state, faction), fallback=fb
+        _decision_model(state, faction), SYSTEM.format(faction=faction),
+        brief(state, faction), fallback=fb,
     ).actions
 
 
