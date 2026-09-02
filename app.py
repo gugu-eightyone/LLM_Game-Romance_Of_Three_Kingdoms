@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 from pydantic import BaseModel, Field
 
@@ -155,14 +156,30 @@ def state_panel() -> None:
         if alerts:
             st.warning("군량 경보 — " + ", ".join(
                 f"{n}: " + ("이번 달 고갈 위험" if r == 0 else f"{r}개월 내 고갈") for n, r in alerts))
+        # ⭐피침 하이라이트(UI 백로그): 군량 경보와 같은 결정론 술어를 빨간 배너로 — 표에 묻히지 않게
+        threats = [(n, t) for n, c in s.cities.items() if c.owner == player
+                   for t in _city_threats(s, n, player)]
+        if threats:
+            st.error("⚠ 피침 — " + ", ".join(
+                f"{n}: {t.faction}군 {t.committed_troops:,}"
+                + (" 성 앞 교전 중" if t.stage == "교전" else " 접근 중") for n, t in threats))
 
-    st.dataframe([{
+    # ⭐도시 표 직관화(사용자 "엑셀표 밤티"): 세력별 바탕색 + 내 도시 우선 정렬
+    _BG = {"위": "background-color: rgba(66,103,178,0.22)",
+           "촉": "background-color: rgba(56,158,86,0.22)",
+           "오": "background-color: rgba(199,84,80,0.22)"}
+    ordered = sorted(s.cities.values(),
+                     key=lambda c: (c.owner != player,
+                                    FACTIONS.index(c.owner) if c.owner in FACTIONS else 9, c.name))
+    df = pd.DataFrame([{
         "도시": c.name, "소유": c.owner, "레벨": c.level, "병력": c.troops,
         "성벽": f"{c.wall} ({_wall_hp(c)}/{_wall_max(c)})",
         "식량": c.food, "금": c.gold, "장수": ", ".join(c.generals),
         "포로": ", ".join(c.prisoners),
         "인접": ", ".join(f"{n}({d})" for n, d in s.distances.get(c.name, {}).items()),
-    } for c in s.cities.values()], height=300, hide_index=True)
+    } for c in ordered])
+    st.dataframe(df.style.apply(lambda r: [_BG.get(r["소유"], "")] * len(r), axis=1),
+                 height=300, hide_index=True)
 
     if s.operations:
         st.markdown("**진행 중 작전**")
@@ -173,10 +190,31 @@ def state_panel() -> None:
                      and o.action.mode == "공성" and tgt is not None
                      else "교전 중" if o.stage == "교전"
                      else f"이동 {o.progress:g}/{o.threshold:g}개월")
-            st.text(f"[{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"
+            line = (f"[{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"
                     f" · {phase} · 병력 {o.committed_troops} · 사기 {o.unit_morale}"
                     + (f" · 전략보정 {o.strategy_mod:+.0%}" if o.strategy_mod else "")
                     + (f" · 장수 {','.join(o.committed_generals)}" if o.committed_generals else ""))
+            if player and o.faction == player:
+                # ⭐작전지시 발견성(사용자 "조작 방도가 왜 없냐"): 내 작전 줄에 인라인 회군/전략변경.
+                # 같은 명령은 작전지시 탭에서도 가능 — 여긴 지름길일 뿐(중복 큐는 버튼 비활성으로 방지).
+                queued = any(getattr(a, "op_id", None) == o.id for a in st.session_state.orders)
+                full = orders_left() <= 0
+                c1, c2, c3 = st.columns([7, 1, 2])
+                c1.text(line)
+                if c2.button("회군", key=f"op_r{o.id}", disabled=queued or full,
+                             help="철수 명령을 큐에 담는다(교전 중=퇴각 손실)"):
+                    st.session_state.orders.append(
+                        OpCommand(kind="작전지시", op_id=o.id, order="회군"))
+                    st.rerun()
+                box = c3.popover("전략변경") if hasattr(st, "popover") else c3.expander("전략변경")
+                with box:
+                    txt = st.text_input("새 전략(50자)", key=f"op_s{o.id}", max_chars=50)
+                    if st.button("하달", key=f"op_sb{o.id}", disabled=queued or full or not txt):
+                        st.session_state.orders.append(
+                            OpCommand(kind="작전지시", op_id=o.id, order="전략변경", strategy=txt))
+                        st.rerun()
+            else:
+                st.text(line)
     with st.expander("주요 연혁"):
         st.text("\n".join(s.chronicle) or "(아직 없음)")
     with st.expander("최근 전황"):
