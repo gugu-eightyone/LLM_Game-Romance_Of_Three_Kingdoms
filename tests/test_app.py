@@ -14,12 +14,13 @@ def _fake_complete(schema, system, user, *, fallback=None, **kw):
 
 def _click(at, label):
     next(b for b in at.button if label in b.label).click()
-    return at.run(timeout=15)
+    return at.run(timeout=60)
 
 
 def test_app_full_turn_offline():
     with patch("src.decide.structured_complete", side_effect=_fake_complete):
-        at = AppTest.from_file(APP).run(timeout=15)
+        # timeout 60: 콜드 임포트(streamlit+pandas)만 ~15s 나오는 환경(OneDrive·저사양 부하)이 실재
+        at = AppTest.from_file(APP).run(timeout=60)
         assert not at.exception
 
         # 세팅 화면 → 기본값(위)으로 시작
@@ -29,7 +30,7 @@ def test_app_full_turn_offline():
 
         # 내정 명령 추가(기본값 금 0 = 상태 무변)
         at.button(key="d_add").click()
-        at = at.run(timeout=15)
+        at = at.run(timeout=60)
         assert len(at.session_state["orders"]) == 1
 
         # 턴 종료 — AI 3세력은 폴백 명령, 앱 안 죽고 결과 창으로

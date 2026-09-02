@@ -134,6 +134,64 @@ def setup_screen() -> None:
             st.rerun()
 
 
+# ======================= 지도 (⭐UI 백로그: data/map.png + HTML 오버레이, 의존성 0) =======================
+# 좌표 = 이미지(1568×1024) 성채 위치의 % 눈대중 — distances 그래프·강·세력색과 전수 대조로 확정.
+# 이미지를 교체하면 이 표만 다시 잡으면 된다. 그림의 성채 색=시작 소유(정적) / 마커 색=현 소유(동적).
+MAP_COORDS = {
+    "업": (66.3, 14.6), "낙양": (40.5, 22.5), "장안": (31.9, 32.2), "허창": (48.8, 29.3),
+    "완": (46.9, 43.0), "수춘": (64.7, 32.7), "하비": (75.9, 38.1), "양양": (59.0, 47.9),
+    "한중": (30.0, 50.3), "성도": (27.1, 61.5), "강주": (31.9, 78.1), "강릉": (42.4, 67.9),
+    "강하": (60.3, 66.4), "여강": (71.1, 59.1), "건업": (85.8, 60.5), "시상": (79.7, 76.7),
+}
+MARK_COLOR = {"위": "#4267b2", "촉": "#389e56", "오": "#c75450"}
+
+
+@st.cache_data
+def _map_b64() -> str | None:
+    """지도 base64 — 원본 PNG 3.2MB는 st.markdown 델타로 매 rerun 실려 무거움 → 축소 JPEG(~0.2MB)로."""
+    p = Path(__file__).parent / "data" / "map.png"
+    if not p.exists():
+        return None
+    import base64
+    import io
+
+    from PIL import Image
+    img = Image.open(p).convert("RGB")
+    img.thumbnail((1200, 1200))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=82)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def map_panel(s: GameState) -> None:
+    img = _map_b64()
+    if img is None:
+        return
+    marks = []
+    for n, (x, y) in MAP_COORDS.items():
+        c = s.cities.get(n)
+        if c is None:
+            continue
+        tip = (f"{n}({c.owner}) 병력 {c.troops:,} · 식량 {c.food:,} · 금 {c.gold:,}"
+               + (f" · 장수 {','.join(c.generals)}" if c.generals else "")
+               + (f" · 포로 {','.join(c.prisoners)}" if c.prisoners else ""))
+        marks.append(
+            f'<div class="ct" style="left:{x}%;top:{y}%" title="{tip}">'
+            f'<span class="dot" style="background:{MARK_COLOR.get(c.owner, "#888")}"></span>'
+            f'<span class="lb">{n}</span></div>')
+    st.markdown(
+        '<style>.mapwrap{position:relative;line-height:0}'
+        '.mapwrap img{width:100%;border-radius:8px}'
+        '.ct{position:absolute;transform:translate(-50%,-110%);text-align:center;line-height:1;cursor:default}'
+        '.dot{display:inline-block;width:11px;height:11px;border-radius:50%;border:2px solid #fff;'
+        'box-shadow:0 0 4px rgba(0,0,0,.8)}'
+        '.lb{display:block;margin-top:2px;font-size:12px;font-weight:700;color:#fff;'
+        'text-shadow:0 0 3px #000,0 0 3px #000}</style>'
+        f'<div class="mapwrap"><img src="data:image/png;base64,{img}">{"".join(marks)}</div>',
+        unsafe_allow_html=True)
+    st.caption("마커 색 = 현재 소유 세력(그림 성채 색은 개전 시점). 마커에 마우스를 올리면 상세.")
+
+
 # ======================= 화면: 정세 =======================
 def state_panel() -> None:
     s, player = S(), st.session_state.player
@@ -164,6 +222,9 @@ def state_panel() -> None:
                 f"{n}: {t.faction}군 {t.committed_troops:,}"
                 + (" 성 앞 교전 중" if t.stage == "교전" else " 접근 중") for n, t in threats))
 
+    with st.expander("전황 지도", expanded=True):
+        map_panel(s)
+
     # ⭐도시 표 직관화(사용자 "엑셀표 밤티"): 세력별 바탕색 + 내 도시 우선 정렬
     _BG = {"위": "background-color: rgba(66,103,178,0.22)",
            "촉": "background-color: rgba(56,158,86,0.22)",
@@ -190,6 +251,11 @@ def state_panel() -> None:
                      and o.action.mode == "공성" and tgt is not None
                      else "교전 중" if o.stage == "교전"
                      else f"이동 {o.progress:g}/{o.threshold:g}개월")
+            # ⭐진행 게이지(사용자 "1/3 표기 맛없다"): 이동=진행률, 공성=성벽 파쇄율. 네이티브 st.progress로 충분.
+            gauge = (min(1.0, o.progress / o.threshold) if o.stage == "이동" and o.threshold > 0
+                     else 1 - _wall_hp(tgt) / _wall_max(tgt) if o.stage == "교전"
+                     and o.action.mode == "공성" and tgt is not None and _wall_max(tgt) > 0
+                     else None)
             line = (f"[{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"
                     f" · {phase} · 병력 {o.committed_troops} · 사기 {o.unit_morale}"
                     + (f" · 전략보정 {o.strategy_mod:+.0%}" if o.strategy_mod else "")
@@ -201,6 +267,8 @@ def state_panel() -> None:
                 full = orders_left() <= 0
                 c1, c2, c3 = st.columns([7, 1, 2])
                 c1.text(line)
+                if gauge is not None:
+                    c1.progress(gauge)
                 if c2.button("회군", key=f"op_r{o.id}", disabled=queued or full,
                              help="철수 명령을 큐에 담는다(교전 중=퇴각 손실)"):
                     st.session_state.orders.append(
@@ -215,6 +283,8 @@ def state_panel() -> None:
                         st.rerun()
             else:
                 st.text(line)
+                if gauge is not None:
+                    st.progress(gauge)
     with st.expander("주요 연혁"):
         st.text("\n".join(s.chronicle) or "(아직 없음)")
     with st.expander("최근 전황"):
