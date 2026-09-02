@@ -74,8 +74,9 @@ def _city_line(state: GameState, name: str, own: bool) -> str:
                        else f"{t.action.origin} 방면에서 약 {max(0.0, t.threshold - t.progress):g}개월 후 도착")
                 parts.append(f"⚠피침: {t.faction}군 {t.committed_troops} {eta}")
     if own:
-        parts += [f"식{c.food}", f"금{c.gold}"]
-        from .engine import food_runway               # 드라이버와 같은 지연 임포트(단방향: engine은 decide를 모름)
+        from .engine import food_net, food_runway     # 드라이버와 같은 지연 임포트(단방향: engine은 decide를 모름)
+        net = food_net(state, name)                   # ⭐월 수지 상시 박기: 소비 산수를 결론으로(역주행 관찰 대응)
+        parts += [f"식{c.food}" + (f"(월{net:+d})" if net is not None else ""), f"금{c.gold}"]
         runway = food_runway(state, name)
         if runway is not None and runway <= FOOD_ALERT_MONTHS:  # ⭐군량 경보: 결정론 결론 박기(피침 경보와 동형)
             parts.append("⚠군량: " + ("이번 달 고갈 위험" if runway == 0

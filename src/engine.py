@@ -1222,21 +1222,23 @@ def _economy_tick(state: GameState) -> None:
     턴 말인 이유: 턴 초에 넣으면 LLM이 브리핑에서 본 숫자와 어긋나 검산 불일치·과투입 노이즈.
     전 도시 size 0(수제 테스트 상태)=경제 없는 판. 정상 틱은 로그 안 남김(16도시×매턴=스팸), 탈영만 기록.
     """
-    if not any(c.size > 0 for c in state.cities.values()):
+    if not any(c.level > 0 for c in state.cities.values()):
         return                                        # 경제 없는 판 — 수입도 병량도 고립 탈영도 없음
     for c in state.cities.values():
-        if c.size <= 0 or c.owner == "중립":
+        if c.level <= 0 or c.owner == "중립":
             continue
-        c.gold += c.size * CITY_INCOME_GOLD
-        c.food += c.size * CITY_INCOME_FOOD
+        c.gold += c.level * CITY_INCOME_GOLD
+        c.food += c.level * CITY_INCOME_FOOD
         upkeep = c.troops // GARRISON_TROOPS_PER_FOOD  # ⭐주둔=절반 소모(사용자 차등)
         if c.food >= upkeep:
             c.food -= upkeep
-        else:                                         # 부족분만큼 탈영 → 유지 가능한 규모로 자기 교정
-            desert = min(c.troops, (upkeep - c.food) * GARRISON_TROOPS_PER_FOOD)
+        else:                                         # ⭐굶주림 통일(사용자 2026-09-02): 못 먹인 인원×비율 매턴 탈영
+            unfed = min(c.troops, (upkeep - c.food) * GARRISON_TROOPS_PER_FOOD)   # 부족분 전액 즉발(절벽) 폐기 —
+            desert = round(unfed * STRANDED_DESERTION)                            # 고립(전원 못 먹음)과 한 공식
             c.food = 0
             c.troops -= desert
-            state.history.append(f"[병량] {c.name}({c.owner}) 군량 부족 — 병사 {desert} 탈영")
+            if desert:
+                state.history.append(f"[병량] {c.name}({c.owner}) 군량 부족 — 병사 {desert} 탈영")
     # ⭐출전 부대 병량 = 균일·복귀지(출발지) 청구(사용자 2026-09-02 — 거리 비례 기각). 주둔이 먼저 먹고
     # 원정군이 남은 창고를 축냄. 부족분=그 부대에서 탈영. 고립(복귀지 없음)=보급 두절, 매턴 비율 탈영(말라죽음).
     for op in state.operations:
@@ -1251,32 +1253,46 @@ def _economy_tick(state: GameState) -> None:
                     f"[병량] 작전{op.id}({op.faction}) 고립 — 보급 두절, 병사 {desert} 탈영")
             continue
         c = state.cities[supply]
-        if c.size <= 0:
+        if c.level <= 0:
             continue
         upkeep = op.committed_troops // TROOPS_PER_FOOD
         if c.food >= upkeep:
             c.food -= upkeep
-        else:
-            desert = min(op.committed_troops, (upkeep - c.food) * TROOPS_PER_FOOD)
+        else:                                         # ⭐굶주림 통일: 주둔과 동일 — 못 먹인 인원×비율 매턴
+            unfed = min(op.committed_troops, (upkeep - c.food) * TROOPS_PER_FOOD)
+            desert = round(unfed * STRANDED_DESERTION)
             c.food = 0
             op.committed_troops -= desert
-            state.history.append(
-                f"[병량] 작전{op.id}({op.faction}) 군량 부족({supply} 창고 고갈) — 병사 {desert} 탈영")
+            if desert:
+                state.history.append(
+                    f"[병량] 작전{op.id}({op.faction}) 군량 부족({supply} 창고 고갈) — 병사 {desert} 탈영")
 
 
-def food_runway(state: GameState, name: str) -> int | None:
-    """현 소모율(주둔 차등+이 도시가 청구받는 원정분) 기준 군량 고갈까지 남은 개월. 흑자·경제 없음=None.
+def food_net(state: GameState, name: str) -> int | None:
+    """도시의 월 식량 수지(레벨 수입 − 주둔 병량 − 청구받는 원정 병량). 경제 없음·중립=None.
 
-    ⭐군량 경보(사용자 "3달 내 위험 시그널") — 피침 경보와 동형: 결정론 결론을 brief·UI에 박는다.
+    ⭐brief 수지 박기(사용자 2026-09-02): "병사가 식량을 먹는다"는 산수를 LLM에게 시키지 않고
+    결론을 상시 노출(결정론 결론 박기 패턴 — 피침 경보·병0 태깅 계보. 장기 런에서 경보 인용하며
+    모병 3000 지르는 역주행 관찰이 근거).
     """
     c = state.cities[name]
-    if c.size <= 0 or c.owner == "중립":
+    if c.level <= 0 or c.owner == "중립":
         return None
     burn = c.troops // GARRISON_TROOPS_PER_FOOD
     burn += sum(o.committed_troops // TROOPS_PER_FOOD for o in state.operations
                 if o.faction == c.owner and o.committed_troops > 0 and _home_city(state, o) == name)
-    net = c.size * CITY_INCOME_FOOD - burn
-    return c.food // -net if net < 0 else None
+    return c.level * CITY_INCOME_FOOD - burn
+
+
+def food_runway(state: GameState, name: str) -> int | None:
+    """현 소모율 기준 군량 고갈까지 남은 개월. 흑자·경제 없음=None.
+
+    ⭐군량 경보(사용자 "3달 내 위험 시그널") — 피침 경보와 동형: 결정론 결론을 brief·UI에 박는다.
+    """
+    net = food_net(state, name)
+    if net is None or net >= 0:
+        return None
+    return state.cities[name].food // -net
 
 
 # ======================= 승리 판정 =======================

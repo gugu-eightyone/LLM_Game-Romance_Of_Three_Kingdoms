@@ -157,7 +157,7 @@ def state_panel() -> None:
                 f"{n}: " + ("이번 달 고갈 위험" if r == 0 else f"{r}개월 내 고갈") for n, r in alerts))
 
     st.dataframe([{
-        "도시": c.name, "소유": c.owner, "규모": c.size, "병력": c.troops,
+        "도시": c.name, "소유": c.owner, "레벨": c.level, "병력": c.troops,
         "성벽": f"{c.wall} ({_wall_hp(c)}/{_wall_max(c)})",
         "식량": c.food, "금": c.gold, "장수": ", ".join(c.generals),
         "포로": ", ".join(c.prisoners),

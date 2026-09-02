@@ -12,7 +12,7 @@ from __future__ import annotations
 import random
 from typing import Literal, Union
 
-from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, TypeAdapter
 
 from .config import STRATEGY_MAX_CHARS  # 캘리브레이션 상수는 config.py에 집약
 
@@ -29,8 +29,10 @@ class City(BaseModel):
     wall: int = 0            # 성벽 레벨(정적): 수비 보너스·최대 HP의 기준. 증축은 미구현(⭐레벨=큐레이트 유지)
     wall_hp: int = -1        # 성벽 내구도(⭐2026-09-01 HP화): -1=미초기화(만액으로 파생 — 구 세이브·수제 상태 호환),
                              # 0=돌파됨. 최대 = (SIEGE_BASE+레벨)×WALL_HP_SCALE. 공성이 깎고 보수·자연회복이 채움.
-    size: int = 0            # 도시 규모(정적 큐레이트 1~3): 경제 틱의 수입 배수. 0=경제 없음(테스트용 추상 도시).
-                             # 성벽과 분리한 이유: 성벽보수로 수입이 오르는 커플링 방지(규모는 불변).
+    level: int = Field(default=0, validation_alias=AliasChoices("level", "size"))
+                             # 도시 레벨(⭐구 size 개명 2026-09-02 — "성벽 견고?" 혼동 + 14PK 성도 레벨 계보):
+                             # 경제 틱의 수입 배수(정적 큐레이트 1~3), 0=경제 없음(테스트용 추상 도시).
+                             # 성벽과 분리한 이유: 성벽보수로 수입이 오르는 커플링 방지. 구 세이브 "size" 로드 호환(alias).
     generals: list[str] = Field(default_factory=list)  # 주둔 장수(로스터 이름 참조)
     prisoners: list[str] = Field(default_factory=list)  # 이 도시에 수감된 포로(포획자=city.owner). 담화 co-location 기반. [[DISCUSSION#9-10]]
 
