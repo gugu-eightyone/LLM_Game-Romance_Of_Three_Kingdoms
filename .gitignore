@@ -19,3 +19,4 @@ CLAUDE.md
 tools/
 # 세이브 파일(로컬 전용)
 saves/
+*.log
