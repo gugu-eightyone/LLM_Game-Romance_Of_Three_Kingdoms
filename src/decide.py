@@ -111,7 +111,8 @@ def brief(state: GameState, faction: FactionName) -> str:
               sorted({x for pair in state.alliances if faction in pair for x in pair} - {faction})]
     lines = [f"[{state.year}년 {state.month}월] 우리={faction}, 군주={f.ruler}"
              + ("(적에게 피랍!)" if captive else "") + f", 사기={f.morale}"
-             + (f", 동맹={','.join(allies)}" if allies else ""),
+             # ⭐부정 케이스도 결론 박기(2026-09-02): 태그 부재로 "동맹 아님"을 추론시키면 파기 선언 환각
+             + (f", 동맹={','.join(allies)}" if allies else ", 동맹=없음(파기 불가)"),
              "[우리 도시]", *[_city_line(state, n, True) for n in mine],
              "[타 세력 도시]", *[_city_line(state, n, False) for n in other]]
     if state.chronicle:                              # 주요 연혁 전량(굵직한 것만이라 짧음) — 원한·대세 기억용
