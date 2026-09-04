@@ -28,7 +28,9 @@ def test_app_full_turn_offline():
         assert not at.exception and at.session_state["mode"] == "play"
         assert len(at.session_state["state"].cities) == 16
 
-        # 내정 명령 추가(기본값 금 0 = 상태 무변)
+        # 내정 명령 추가(기본값 금 0 = 상태 무변). segmented_control 탭이라 먼저 내정으로 전환
+        at.session_state["order_tab"] = "내정"
+        at = at.run(timeout=60)
         at.button(key="d_add").click()
         at = at.run(timeout=60)
         assert len(at.session_state["orders"]) == 1

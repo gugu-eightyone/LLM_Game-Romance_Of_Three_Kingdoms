@@ -773,7 +773,9 @@ def _resolve_combat(state: GameState, matchup: "MatchupFn | None" = None) -> Non
             _siege_round(state, op)
     for op in list(state.operations):                # 종료 판정
         _resolve_op_end(state, op, n_opp.get(op.id, 0), killers.get(op.id))
-    engaged = {op.id for pair in pairs for op in pair}
+    # ⭐즉시 복귀(2026-09-05 사용자 "왜 재정비 턴이 필요한데"): 전투 해소 후 살아있는 교전 쌍을
+    # 재계산 — 상대가 이 턴에 소멸했으면 다음 달을 기다리지 않고 바로 성내 복귀(재정비 턴 폐지).
+    engaged = _field_engaged_ids(state)
     for op in list(state.operations):                # 야전 승자(교전 마치고 상대 소멸) → 자동 복귀(서브초이스2)
         if op.action.mode != "야전" or op.id in engaged or op.committed_troops <= 0:
             continue
@@ -1190,6 +1192,9 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
         state.history.append(f"[외교] {b}, {a}의 {prop.proposal} 제안 거절"
                              + (f" ({reason})" if reason else ""))
         return False
+    # ⭐수락에도 상대의 한마디 노출(마찰 14 — 사용자 "수락에도 상대의 한 마디가 보이길")
+    state.history.append(f"[외교] {b}, {a}의 {prop.proposal} 제안 수락"
+                         + (f" ({reason})" if reason else ""))
     if prop.proposal == "동맹":
         pair = tuple(sorted((a, b)))
         months = prop.months if prop.months > 0 else ALLIANCE_DEFAULT_MONTHS

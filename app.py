@@ -312,6 +312,43 @@ def state_panel() -> None:
 
 
 # ======================= 화면: 명령 작성 =======================
+_ORDER_ICON = {"전투": "⚔", "내정": "🏯", "호송": "🐎", "작전지시": "🚩", "외교": "🕊", "처분": "⚖", "설득": "🗣"}
+
+
+def _order_line(a) -> str:
+    """큐 명령 한 줄 요약(마찰 11: dict 원문 대신). 종류별 핵심만 — 상세는 어차피 방금 본 입력."""
+    k = a.kind
+    if k == "전투":
+        body = f"{a.mode} {a.origin}→{a.target} · 병 {a.troops:,}" \
+            + (f" · {a.generals[0]}" if a.generals else "") \
+            + (f" · 「{a.strategy}」" if a.strategy else "")
+    elif k == "내정":
+        body = f"{a.item} {a.city} · 금 {a.gold_spent:,}" + (f" · 담당 {a.general}" if a.general else "") \
+            + (f" · 「{a.strategy}」" if a.strategy else "")
+    elif k == "호송":
+        load = [x for x in (f"병 {a.troops:,}" if a.troops else "", " ".join(a.generals),
+                            " ".join(f"포로 {p}" for p in a.prisoners),
+                            f"금 {a.gold:,}" if a.gold else "", f"식량 {a.food:,}" if a.food else "") if x]
+        body = f"{a.origin}→{a.target} · " + " · ".join(load or ["빈 수레"])
+    elif k == "작전지시":
+        body = f"작전{a.op_id} {a.order}" + (f" · 「{a.strategy}」" if a.strategy else "")
+    elif k == "외교":
+        body = f"{a.target_faction}에 {a.proposal}" \
+            + (f" {a.months}개월" if a.proposal == "동맹" else "") \
+            + (f" · {a.prisoner}" if getattr(a, "prisoner", "") else "")
+    elif k == "처분":
+        body = f"{a.prisoner} {a.choice} ({a.city})"
+    else:
+        body = a.model_dump_json(exclude_defaults=True)
+    return f"{_ORDER_ICON.get(k, '•')} **{k}** — {body}"
+
+
+def _clear_inputs(*keys: str) -> None:
+    """명령 추가 직후 입력 위젯 초기화(마찰 10: 이전 입력 잔존 방지 — key 삭제=기본값 복귀)."""
+    for k in keys:
+        st.session_state.pop(k, None)
+
+
 def order_builder() -> None:
     s, player = S(), st.session_state.player
     left = orders_left()
@@ -320,15 +357,29 @@ def order_builder() -> None:
                "세력 간 순서는 공정성을 위해 매달 시드 랜덤. 모병한 병력은 다음 달부터 출격 가능.")
     for i, a in enumerate(st.session_state.orders):
         c1, c2 = st.columns([9, 1])
-        c1.code(a.model_dump_json(exclude_defaults=True), language="json")
+        c1.markdown(_order_line(a))                   # ⭐dict 원문 대신 읽히는 한 줄(마찰 11)
         if c2.button("✕", key=f"del{i}"):
             st.session_state.orders.pop(i)
             st.rerun()
 
-    mine = [n for n, c in s.cities.items() if c.owner == player]
-    tabs = st.tabs(["전투", "내정", "호송", "작전지시", "외교"])
+    # ⭐큐에 담긴 장수는 후보에서 제외(마찰 9 — 한 장수 한 턴 한 임무, 엔진 규칙의 UI 가드)
+    used_gens = {g for o in st.session_state.orders
+                 for g in (*getattr(o, "generals", []),
+                           *([o.general] if getattr(o, "general", "") else []))}
+    free = lambda names: [n for n in names if n not in used_gens]
+    # ⭐큐가 선점한 금·식량도 가용에서 차감(병력·장수와 같은 원칙 — 명령 결정 즉시 수치 갱신)
+    q = st.session_state.orders
+    q_gold = lambda c: (sum(a.gold_spent for a in q if a.kind == "내정" and a.city == c)
+                        + sum(a.gold for a in q if a.kind == "호송" and a.origin == c))
+    q_food = lambda c: sum(a.food for a in q if a.kind == "호송" and a.origin == c)
 
-    with tabs[0]:                                     # 전투: 출격 UI = LLM 명령서와 같은 양식(§TODO)
+    mine = [n for n, c in s.cities.items() if c.owner == player]
+    # ⭐st.tabs는 rerun마다 첫 탭 리셋(마찰 18) → 상태 유지되는 segmented_control
+    tab = st.segmented_control("명령 종류", ["전투", "내정", "호송", "작전지시", "외교"],
+                               key="order_tab", default="전투",
+                               label_visibility="collapsed") or "전투"
+
+    if tab == "전투":                                 # 전투: 출격 UI = LLM 명령서와 같은 양식(§TODO)
         armed = [n for n in mine if s.cities[n].troops > 0]
         if not armed:
             st.caption("출병 가능한 도시가 없다.")
@@ -354,26 +405,30 @@ def order_builder() -> None:
                                      min(10000, max(1, avail)), key="b_n")
             # 장수 1명만(⭐사용자 2026-08-30): 추가 동행은 전투력 0 기여+포획 리스크뿐인 함정 선택지.
             # 장수 재배치는 호송 탭이 전용 동사. AI 경로는 리스트 유지(비대칭 원칙 — 위반 아님).
-            gen = st.selectbox("지휘 장수", ["(없음)"] + city.generals, key="b_g",
-                               help="부대 전투력 = 병력 × 장수 통솔 보정. 없이도 출격은 가능(보정 없음).")
+            gen = st.selectbox("지휘 장수", ["(없음)"] + free(city.generals), key="b_g",
+                               help="부대 전투력 = 병력 × 장수 통솔 보정. 없이도 출격은 가능(보정 없음). "
+                                    "이번 턴 다른 명령에 쓴 장수는 목록에서 빠진다(한 장수 한 턴 한 임무).")
             strat = st.text_input("전략(50자)", max_chars=50, key="b_s")
             if st.button("명령 추가", key="b_add", disabled=left <= 0 or target is None or avail <= 0):
                 st.session_state.orders.append(Battle(
                     kind="전투", mode="야전" if mode == "출성" else mode, origin=origin,
                     target=target, troops=int(troops),
                     generals=[] if gen == "(없음)" else [gen], strategy=strat))
+                _clear_inputs("b_n", "b_g", "b_s")
                 st.rerun()
 
-    with tabs[1]:
+    elif tab == "내정":
         city_n = st.selectbox("도시", mine, key="d_c")
         item = st.radio("항목", ["식량증산", "모병", "사기진작", "성벽보수"], horizontal=True, key="d_i")
-        gold = st.number_input(f"투입 금 (보유 {s.cities[city_n].gold:,})",
-                               0, max(0, s.cities[city_n].gold), 0, key="d_g",
+        d_avail = max(0, s.cities[city_n].gold - q_gold(city_n))
+        gold = st.number_input(f"투입 금 (가용 {d_avail:,})",
+                               0, d_avail, 0, key="d_g",
                                help="식량증산: 금 1→2. 모병: 금이 클수록 효율이 로그로 감소(도배 비추). "
                                     "성벽보수 = 파손 HP 복구(금 3당 1, 온전하면 기각). 사기진작은 80까지만(그 이상=금만 소모).")
         # ⭐담당 장수: 모병=통솔·식량/성벽=지력 비례 효율(안내 한 세트 — 사용자 확정)
-        overseer = st.selectbox("담당 장수(선택)", ["(없음)"] + s.cities[city_n].generals, key="d_gen",
-                                help="모병=통솔, 식량증산·성벽보수=지력에 비례해 효율 상승. 사기진작은 무관.")
+        overseer = st.selectbox("담당 장수(선택)", ["(없음)"] + free(s.cities[city_n].generals), key="d_gen",
+                                help="모병=통솔, 식량증산·성벽보수=지력에 비례해 효율 상승. 사기진작은 무관. "
+                                    "이번 턴 다른 명령에 쓴 장수는 목록에서 빠진다.")
         strat = ""
         if item == "모병":
             strat = st.text_input("모병 방침(50자 — 심판이 채점해 효율 ±30%)", max_chars=50, key="d_s")
@@ -383,9 +438,10 @@ def order_builder() -> None:
             st.session_state.orders.append(Domestic(
                 kind="내정", city=city_n, item=item, gold_spent=int(gold),
                 general="" if overseer == "(없음)" else overseer, strategy=strat))
+            _clear_inputs("d_g", "d_gen", "d_s", "d_s2")
             st.rerun()
 
-    with tabs[2]:                                     # 호송: 인접 아군 도시만(위젯이 걸러줌)
+    elif tab == "호송":                               # 호송: 인접 아군 도시만(위젯이 걸러줌)
         pairs = [(o, t) for o in mine for t in s.distances.get(o, {}) if t in mine]
         if not pairs:
             st.caption("호송 가능한 아군 인접 경로가 없다.")
@@ -398,33 +454,45 @@ def order_builder() -> None:
             t_avail = max(0, city.troops - reserved)
             troops = st.number_input(f"병사 (가용 {t_avail:,})", 0, t_avail, 0, key="t_n",
                                      help="병사·물자·포로를 실으면 호위 최소 200. 장수 단독은 무호위 가능.")
-            gens = st.multiselect("장수", city.generals, key="t_g")
+            gens = st.multiselect("장수", free(city.generals), key="t_g")
             pris = st.multiselect("포로", city.prisoners, key="t_p")
-            gold = st.number_input(f"금 (보유 {city.gold:,})", 0, max(0, city.gold), 0, key="t_gold")
-            food = st.number_input(f"식량 (보유 {city.food:,})", 0, max(0, city.food), 0, key="t_f")
+            tg_avail = max(0, city.gold - q_gold(origin))
+            tf_avail = max(0, city.food - q_food(origin))
+            gold = st.number_input(f"금 (가용 {tg_avail:,})", 0, tg_avail, 0, key="t_gold")
+            food = st.number_input(f"식량 (가용 {tf_avail:,})", 0, tf_avail, 0, key="t_f")
+            # ⭐호송 규칙 티칭(마찰 8 — 사용자 문답으로 확정된 전체 그림)
+            st.caption("호송은 길 위에선 호위대다 — 반대 방향 적과 마주치면 요격전(탑승 최고 통솔 장수가 지휘, "
+                       "장수 수 스택 없음). 도착 즉시 수비대 합류·화물 하역. 목적지가 먼저 함락되면 화물째 회군.")
             if st.button("명령 추가", key="t_add", disabled=left <= 0):
                 st.session_state.orders.append(Transfer(
                     kind="호송", origin=origin, target=target, troops=int(troops),
                     generals=gens, prisoners=pris, gold=int(gold), food=int(food)))
+                _clear_inputs("t_n", "t_g", "t_p", "t_gold", "t_f")
                 st.rerun()
 
-    with tabs[3]:
+    elif tab == "작전지시":
         ops = [o for o in s.operations if o.faction == player]
         if not ops:
             st.caption("진행 중인 우리 작전이 없다.")
         else:
+            st.caption("작전지시도 명령 1회를 소모한다. 교전을 마친 출성·요격 부대는 상대가 "
+                       "소멸하면 그 턴에 자동 복귀하니 회군 명령이 필요 없다.")   # ⭐마찰 16(즉시 복귀)
             label = {o.id: f"[{o.id}] {o.action.origin}→{o.action.target} {o.action.mode} ({o.stage})"
                      for o in ops}
             op_id = st.selectbox("작전", list(label), format_func=label.get, key="o_id")
-            order = st.radio("지시", ["전략변경", "회군"], horizontal=True, key="o_ord",
-                             help="회군: 교전 중이면 퇴각 손실. 전략변경: 전략문 교체.")
+            sel = next(o for o in ops if o.id == op_id)
+            # ⭐호송은 전략이 없음(마찰 20): 적게 해놓고 기각하는 함정 제거 — 회군만 노출
+            choices = ["회군"] if sel.action.mode == "호송" else ["전략변경", "회군"]
+            order = st.radio("지시", choices, horizontal=True, key="o_ord",
+                             help="회군: 교전 중이면 퇴각 손실. 전략변경: 전략문 교체(호송은 비전투 이동이라 전략 없음).")
             strat = st.text_input("새 전략(50자)", max_chars=50, key="o_s") if order == "전략변경" else ""
             if st.button("명령 추가", key="o_add", disabled=left <= 0):
                 st.session_state.orders.append(OpCommand(
                     kind="작전지시", op_id=op_id, order=order, strategy=strat))
+                _clear_inputs("o_s")
                 st.rerun()
 
-    with tabs[4]:                                     # 외교: 성립 가능한 제안만 노출(파기=동맹 중일 때만, ⭐§9-22)
+    elif tab == "외교":                               # 외교: 성립 가능한 제안만 노출(파기=동맹 중일 때만, ⭐§9-22)
         others = [f for f in FACTIONS if f != player and s.factions[f].alive]
         if not others:
             st.caption("남은 세력이 없다.")
@@ -447,21 +515,27 @@ def order_builder() -> None:
             prisoner, og, of = "", 0, 0
             if prop == "포로반환":
                 prisoner = st.selectbox("되찾을 장수", my_captured, key="dp_pr")
-                max_g = max((c.gold for c in s.cities.values() if c.owner == player), default=0)
-                max_f = max((c.food for c in s.cities.values() if c.owner == player), default=0)
+                # 몸값=자국 최대 보유 도시에서 지불(엔진) — 큐에 담긴 몸값 합을 근사 차감
+                r_g = sum(getattr(a, "offer_gold", 0) for a in q if a.kind == "외교")
+                r_f = sum(getattr(a, "offer_food", 0) for a in q if a.kind == "외교")
+                max_g = max(0, max((c.gold for c in s.cities.values() if c.owner == player), default=0) - r_g)
+                max_f = max(0, max((c.food for c in s.cities.values() if c.owner == player), default=0) - r_f)
                 og = st.number_input(f"몸값 금 (지불 가능 {max_g:,})", 0, max_g, 0, key="dp_g")
                 of = st.number_input(f"몸값 식량 (지불 가능 {max_f:,})", 0, max_f, 0, key="dp_f")
             envoy, msg = "", ""
             if prop != "파기":
                 my_gens = [g.name for g in s.generals.values() if g.faction == player]
                 envoy = st.selectbox("사신(서사용)", [""] + my_gens, key="dp_e")
-                msg = st.text_input("국서(50자)", max_chars=50, key="dp_m")
+                msg = st.text_input("국서(50자)", max_chars=50, key="dp_m",
+                                    help="⭐상대 군주가 국서를 읽고 수락/거절 판단에 실제로 반영한다 — "
+                                         "빈 국서보다 설득력 있는 한 줄이 승인 확률을 높인다.")
             if st.button("명령 추가", key="dp_add", disabled=left <= 0):
                 st.session_state.orders.append(Diplomacy(
                     kind="외교", target_faction=t,
                     proposal="동맹" if prop == "연장" else prop,   # 연장=동맹 재제안(엔진 규약)
                     months=int(months), prisoner=prisoner,
                     offer_gold=int(og), offer_food=int(of), envoy=envoy, message=msg))
+                _clear_inputs("dp_m", "dp_g", "dp_f")
                 st.rerun()
 
     # 포로 담화(설득)·후속 처분 — 담화=슬롯 즉시 소모(§9-21), 석방/처형=처분 명령(⭐배치4)
@@ -486,9 +560,13 @@ def order_builder() -> None:
                     st.rerun()
 
     st.divider()
-    if st.button("🏁 턴 종료(이대로 진행)", type="primary"):
+    c1, c2 = st.columns([4, 1])
+    if c1.button("🏁 턴 종료(이대로 진행)", type="primary"):
         end_turn()
         st.rerun()
+    # ⭐저장 발견성(마찰 15): 사이드바에만 있던 걸 명령 화면에도 — 같은 퀵세이브
+    if c2.button("💾 저장", key="save_main", help="턴 경계 상태 저장. 작성 중인 명령 큐는 저장되지 않는다."):
+        st.toast(f"저장됨: {save_game().stem}")
 
 
 # ======================= 화면: 담화 =======================
