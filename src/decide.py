@@ -41,6 +41,87 @@ class JudgeScore(BaseModel):
 JUDGE_SYSTEMS = {"전투": load_prompt("strategy_judge"), "내정": load_prompt("domestic_judge")}
 
 
+class JudgeScores(BaseModel):
+    """일괄 채점(⭐2026-09-05 계획 단위 채점): scores는 입력 나열과 같은 순서."""
+    scores: list[JudgeScore]
+
+
+def _judged_texts(actions: dict) -> dict[tuple[str, str], list[tuple[str, str]]]:
+    """(세력, 심판종류) → [(전략문, 행동 한줄)]. 엔진이 채점하는 집합과 동일(전투=출격·전략변경 / 내정)."""
+    out: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for faction, acts in actions.items():
+        for a in (acts if isinstance(acts, list) else [acts]):
+            text = getattr(a, "strategy", "")
+            if not text:
+                continue
+            if a.kind == "전투":
+                ctx = f"{a.mode} {a.origin}→{a.target} 병{a.troops}"
+            elif a.kind == "작전지시" and a.order == "전략변경":
+                ctx = f"작전{a.op_id} 전략변경"
+            elif a.kind == "내정":
+                ctx = f"{a.item} {a.city}"
+            else:
+                continue                              # 계략·설득 등은 각자 서브시스템(여기 채점 아님)
+            out.setdefault((faction, "내정" if a.kind == "내정" else "전투"), []).append((text, ctx))
+    return out
+
+
+def turn_judge(state: GameState, actions: dict):
+    """⭐계획 단위 일괄 채점(2026-09-05, 마찰 22): (세력,종류)별 이번 턴 전략 전부를 한 호출로 채점.
+
+    분할 협공이 낱개 병력으로 "과장" 삼중 감점되던 문맥 결손 해소 + 호출 N→1. 엔진 JudgeFn과
+    호환되는 콜백을 돌려줌(엔진 무변). 채점 상태=턴 시작 brief(행위자 정보 집합과 동일 — 상대
+    같은 턴 숨은 수는 의도적으로 안 봄, 카운터는 상성 판정·전략변경 재채점 몫). 단건·캐시 미스·
+    실패·길이 불일치는 기존 단건 action_judge로 폴백(악화 없음).
+    """
+    cache: dict[tuple[str, str, str], tuple[int, str]] = {}
+    for (faction, kind), items in _judged_texts(actions).items():
+        if len(items) < 2:                            # 단건=기존 경로와 동일 거동
+            continue
+        listing = "\n".join(f"{i}. ({ctx}) 「{t}」" for i, (t, ctx) in enumerate(items, 1))
+        try:
+            v = structured_complete(
+                JudgeScores, JUDGE_SYSTEMS[kind].format(faction=faction),
+                brief(state, faction)
+                + f"\n\n[채점 대상 — {faction}의 이번 턴 {kind} 전략 {len(items)}건. "
+                f"같은 턴에 함께 내려진 한 계획의 부분들이다 — 각각을 계획 전체 맥락에서 채점, "
+                f"scores 배열은 번호 순서대로]\n{listing}")
+        except LLMError:
+            continue
+        if len(v.scores) != len(items):
+            continue                                  # 배열 길이 불일치 → 단건 폴백(안전)
+        for (t, _), sc in zip(items, v.scores):
+            cache[(faction, kind, t)] = (sc.score, sc.reason)
+
+    def judge(st: GameState, faction: str, kind: str, text: str) -> tuple[int, str] | None:
+        return cache.get((faction, kind, text)) or action_judge(st, faction, kind, text)
+    return judge
+
+
+class MatchupVerdict(BaseModel):
+    """상성 판정: 명확히 맞물릴 때만 갑/을 — 애매하면 없음(기본값이 보수 쪽)."""
+    advantage: Literal["갑", "을", "없음"] = "없음"
+    reason: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
+
+
+MATCHUP_SYSTEM = load_prompt("matchup_judge")
+
+
+def matchup_judge(state: GameState, ctx: str, fa: str, ta: str,
+                  fb: str, tb: str) -> tuple[int, str] | None:
+    """⭐교전 상성 소심판(2026-09-05): 실제 맞붙은 두 전략의 상호작용만 판정(품질 재채점 금지 — 이중 계상 방지).
+
+    입력=두 전략문+교전 한 줄(전황 전체 안 실음 — 데이터 최소). 실패=None(보정 0, 공짜 없음).
+    """
+    try:
+        v = structured_complete(
+            MatchupVerdict, MATCHUP_SYSTEM,
+            f"[교전] {ctx}\n갑({fa}): 「{ta}」\n을({fb}): 「{tb}」")
+        return {"갑": 1, "을": -1}.get(v.advantage, 0), v.reason
+    except LLMError:
+        return None
+
+
 def action_judge(state: GameState, faction: str, kind: str, text: str) -> tuple[int, str] | None:
     """엔진에 주입하는 심판 콜백(§9-11: kind로 코드 라우팅 → 도메인 특화 심판, 분류 LLM 없음).
 
@@ -323,7 +404,8 @@ def demo(turns: int = 6) -> None:
         for f, acts in actions.items():
             for a in acts:
                 print(f"  {f}: {a.model_dump_json(exclude_defaults=True)}")
-        advance_turn(state, actions, judge=action_judge)   # ⭐전략·모병 심판 배선(스모크=실 채점)
+        # ⭐계획 단위 일괄 채점 + 교전 상성(2026-09-05) — 스모크=실 채점
+        advance_turn(state, actions, judge=turn_judge(state, actions), matchup=matchup_judge)
         resolve_dispositions(state, verbose=True)    # 포획 포로 즉결 처분(§9-21)
         resolve_proposals(state, verbose=True)       # 외교 제안 응답(§9-22)
         print(f"[{state.year}년 {state.month}월 종료]")

@@ -27,7 +27,7 @@ from .config import (
     GARRISON_TROOPS_PER_FOOD, STRANDED_DESERTION,
     RECRUIT_CURVE_SCALE, STRATEGY_MODIFIER_BOUND, TROOPS_PER_FOOD,
     FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
-    MAX_ORDERS_PER_TURN, MORALE_CITY_LOST, MORALE_CITY_TAKEN, MORALE_COMBAT_BAND,
+    MATCHUP_MODIFIER_BOUND, MAX_ORDERS_PER_TURN, MORALE_CITY_LOST, MORALE_CITY_TAKEN, MORALE_COMBAT_BAND,
     MORALE_FEAST_CAP, MORALE_RULER_CAPTURED,
     PERSUADE_BASE, PERSUADE_INTEL_SCALE, PREP_CAP, PREP_RATE,
     SURRENDER_CITY_GATE, SURRENDER_CITY_WEIGHT,
@@ -42,6 +42,10 @@ SCENARIO_PATH = Path(__file__).resolve().parent.parent / "data" / "scenario.json
 # 심판 콜백(⭐2026-09-02 judge 배선): (state, faction, kind∈{전투,내정}, 전략문) → (점수 1~10, 사유) | None(실패).
 # LLM 호출은 판단층(decide) 몫 — 엔진은 콜백으로 주입받아 점수→보정 산수만(단방향 유지, 테스트=None이면 결정론 무변).
 JudgeFn = Callable[["GameState", str, str, str], "tuple[int, str] | None"]
+
+# 상성 심판 콜백(⭐2026-09-05): (state, 교전요약, 갑세력, 갑전략, 을세력, 을전략) → (갑 기준 우열 -1|0|1, 사유) | None(실패).
+# 실제로 맞붙은 쌍만, 양쪽 전략이 있을 때만 호출 — 명확히 맞물릴 때만 ±MATCHUP_MODIFIER_BOUND(애매=0).
+MatchupFn = Callable[["GameState", str, str, str, str, str], "tuple[int, str] | None"]
 
 
 def _judge_mod(score: int | None, bound: float) -> float:
@@ -698,16 +702,46 @@ def _field_engaged_ids(state: GameState) -> set[int]:
     return {op.id for pair in _field_engagements(state) for op in pair}
 
 
+def _matchup_mods(state: GameState, a: ActiveOperation, b: ActiveOperation,
+                  matchup: "MatchupFn | None") -> tuple[float, float]:
+    """⭐교전 상성 보정(2026-09-05): 실제로 맞붙은 쌍의 전략 텍스트가 명확히 맞물릴 때만 유리 +/불리 −.
+
+    쌍당 1회 판정 후 캐시(키에 전략문 포함 → 전략변경 시 자동 재판정). 무전략·애매·판정실패=0.
+    계획 채점(사전, 자기 정보만)과 직교 — 카운터의 보람은 충돌 순간에만 발생(정보 누출 없음).
+    """
+    ta = getattr(a.action, "strategy", "")             # 호송(Transfer)은 전략 필드 자체가 없음=상성 불참
+    tb = getattr(b.action, "strategy", "")
+    if matchup is None or not ta or not tb:
+        return 0.0, 0.0
+    lo, hi = (a, b) if a.id < b.id else (b, a)
+    key = f"{lo.id}|{hi.id}|{getattr(lo.action, 'strategy', '')}|{getattr(hi.action, 'strategy', '')}"
+    v = state.matchup_cache.get(key)
+    if v is None:
+        ctx = (f"{lo.faction} {lo.action.mode}({lo.action.origin}→{lo.action.target}) vs "
+               f"{hi.faction} {hi.action.mode}({hi.action.origin}→{hi.action.target})")
+        verdict = matchup(state, ctx, lo.faction, lo.action.strategy, hi.faction, hi.action.strategy)
+        adv, reason = verdict if verdict is not None else (0, "")
+        v = adv * MATCHUP_MODIFIER_BOUND
+        state.matchup_cache[key] = v                  # 실패도 0으로 캐시(같은 쌍 재호출 안 함)
+        if v:
+            win = lo if v > 0 else hi
+            state.history.append(
+                f"[상성] 작전{lo.id}({lo.faction}) ↔ 작전{hi.id}({hi.faction}): "
+                f"작전{win.id} 전략이 맞물려 유리 ({reason}) → ±{MATCHUP_MODIFIER_BOUND:.0%}")
+    return (v, -v) if a.id == lo.id else (-v, v)
+
+
 def _field_round(state: GameState, a: ActiveOperation, b: ActiveOperation,
-                 killers: dict[int, str]) -> None:
+                 killers: dict[int, str], ma: float = 0.0, mb: float = 0.0) -> None:
     """야전 1라운드(부대 vs 부대, wall=0, 순수 대칭). 협공은 '두 번 맞음'으로 자연 발생(보너스 없음).
 
     killers: 이 라운드에서 상대를 궤멸시킨 세력 기록(마지막 타격 귀속) — 전리품·포로가 승자에게 가게(⭐2026-09-01).
+    ma/mb: 상성 보정(_matchup_mods) — 계획 보정에 가산(합산 상한 ±0.40 허용, 별개 축이라 의도).
     """
     a_loss, b_loss, _ = _combat_round(
         state,
-        Force(a.committed_troops, a.committed_generals, morale=a.unit_morale, mod=a.strategy_mod),
-        Force(b.committed_troops, b.committed_generals, morale=b.unit_morale, mod=b.strategy_mod))
+        Force(a.committed_troops, a.committed_generals, morale=a.unit_morale, mod=a.strategy_mod + ma),
+        Force(b.committed_troops, b.committed_generals, morale=b.unit_morale, mod=b.strategy_mod + mb))
     a0, b0 = a.committed_troops, b.committed_troops
     a.committed_troops -= a_loss
     b.committed_troops -= b_loss
@@ -724,13 +758,14 @@ def _field_round(state: GameState, a: ActiveOperation, b: ActiveOperation,
         f"[야전] 작전{a.id}({a.faction}) ↔ 작전{b.id}({b.faction}): -{a_loss}/-{b_loss}")
 
 
-def _resolve_combat(state: GameState) -> None:
+def _resolve_combat(state: GameState, matchup: "MatchupFn | None" = None) -> None:
     """한 턴 전투 해소: 야전(필드 쌍) → 공성(수비대) → 종료(전멸/퇴각/포로) → 야전 승자 복귀."""
     pairs = _field_engagements(state)
     n_opp: dict[int, int] = {}
     killers: dict[int, str] = {}                     # 궤멸 op → 마지막 타격 세력(전리품 귀속, ⭐2026-09-01)
     for a, b in pairs:
-        _field_round(state, a, b, killers)
+        ma, mb = _matchup_mods(state, a, b, matchup)  # ⭐상성(쌍당 1회 캐시, 무전략=0·호출 0)
+        _field_round(state, a, b, killers, ma, mb)
         n_opp[a.id] = n_opp.get(a.id, 0) + 1
         n_opp[b.id] = n_opp.get(b.id, 0) + 1
     for op in list(state.operations):                # 공성 라운드(필드 피해 반영된 병력으로 → 협공 자연 발생)
@@ -1341,7 +1376,8 @@ def _order_phase(action) -> int:
 
 
 def advance_turn(state: GameState, actions: list | dict,
-                 judge: JudgeFn | None = None) -> None:
+                 judge: JudgeFn | None = None,
+                 matchup: "MatchupFn | None" = None) -> None:
     """한 달 진행: 개시/내정 → 이동(마일스톤) → 전투 해소(야전·공성·퇴각·포로) → 승리 → 시간.
 
     actions: `{세력: Action | list[Action]}` dict면 행위자 소유권 검증 + 명령 상한(LLM 경로),
@@ -1372,7 +1408,7 @@ def advance_turn(state: GameState, actions: list | dict,
     for actor, a in items:
         _dispatch(state, a, actor, judge)
     _advance_movement(state)                          # 이동중 작전 진행(필드 교전=고정)
-    _resolve_combat(state)                            # 야전 쌍 → 공성 → 종료 판정
+    _resolve_combat(state, matchup)                   # 야전 쌍(⭐상성 포함) → 공성 → 종료 판정
     _economy_tick(state)                              # 수입·병량(턴 말 — 다음 brief가 갱신값을 봄)
     captured = frozenset(n for n, c in state.cities.items() if c.owner != owners0.get(n))
     _wall_regen(state, skip=captured)                 # 평시 성벽 자연회복(피침·점령 턴 제외, ⭐HP화)

@@ -99,6 +99,8 @@ class GameState(BaseModel):
     pending_captives: list[tuple[str, str]] = Field(default_factory=list)  # 신규 포획 (도시, 장수) — 즉결 처분 질의는 포획 시 1회만(수감 후엔 설득 명령·몸값 영역)
     proposals: list[Proposal] = Field(default_factory=list)         # 대기 외교 제안 큐(턴 해소 후 상대 군주 질의로 소진)
     winner: FactionName | None = None            # 승리 판정 결과(None=진행 중)
+    matchup_cache: dict[str, float] = Field(default_factory=dict)  # ⭐상성 판정 캐시(2026-09-05): "loId|hiId|전략a|전략b"→낮은id쪽 보정.
+                                                  # 키에 전략문 포함=전략변경 시 자동 재판정. ponytail: 낡은 키 미청소 — 판당 수십 개 상한이라 방치.
     history: list[str] = Field(default_factory=list)
     chronicle: list[str] = Field(default_factory=list)  # 주요 연혁(함락·군주 포획/승계·처형·멸망). 영구 보존, brief 전량 노출 → "장비의 원수"를 LLM이 기억. 요약 LLM 불필요.
 

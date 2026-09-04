@@ -16,7 +16,8 @@ import streamlit as st
 from pydantic import BaseModel, Field
 
 from src.config import FOOD_ALERT_MONTHS, MAX_ORDERS_PER_TURN, PARLEY_MAX_ROUNDS
-from src.decide import action_judge, brief, decide, resolve_dispositions, resolve_proposals
+from src.decide import (brief, decide, matchup_judge, resolve_dispositions,
+                        resolve_proposals, turn_judge)
 from src.engine import (_city_threats, _wall_hp, _wall_max, advance_turn, allied,
                         apply_disposition, attempt_persuade, food_runway, load_scenario,
                         respond_proposal, surrender_gate)
@@ -96,7 +97,8 @@ def end_turn() -> None:
             if a:
                 actions[name] = a
     with st.spinner("심판이 전략을 채점하고 전투가 벌어진다..."):
-        advance_turn(s, actions, judge=action_judge)   # ⭐전략·모병 심판 배선(플레이어 전략도 채점=가시화)
+        # ⭐계획 단위 일괄 채점 + 교전 상성(2026-09-05) — 플레이어 전략도 같은 심판(가시화)
+        advance_turn(s, actions, judge=turn_judge(s, actions), matchup=matchup_judge)
     with st.spinner("전후 처리(포로·외교)..."):
         resolve_dispositions(s, player=player)        # 플레이어 몫은 큐 잔존 → 결과 창이 소비
         resolve_proposals(s, player=player)
@@ -167,6 +169,18 @@ def map_panel(s: GameState) -> None:
     img = _map_b64()
     if img is None:
         return
+    edges = {frozenset((a, b)) for a, nbs in s.distances.items() for b in nbs
+             if a in MAP_COORDS and b in MAP_COORDS}
+    lines = []
+    for a, b in (sorted(e) for e in edges):
+        (x1, y1), (x2, y2) = MAP_COORDS[a], MAP_COORDS[b]
+        lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}"/>')
+        # 이정표 점 = 행군 월 단위 지점(교전 발생 위치). d개월 길 → 중간점 d-1개.
+        d = s.distances.get(a, {}).get(b) or s.distances.get(b, {}).get(a) or 1
+        for i in range(1, d):
+            mx, my = x1 + (x2 - x1) * i / d, y1 + (y2 - y1) * i / d
+            lines.append(f'<line class="ms" x1="{mx}" y1="{my}" x2="{mx}" y2="{my}"/>')
+    roads = (f'<svg class="roads" viewBox="0 0 100 100" preserveAspectRatio="none">{"".join(lines)}</svg>')
     marks = []
     for n, (x, y) in MAP_COORDS.items():
         c = s.cities.get(n)
@@ -182,12 +196,15 @@ def map_panel(s: GameState) -> None:
     st.markdown(
         '<style>.mapwrap{position:relative;line-height:0}'
         '.mapwrap img{width:100%;border-radius:8px}'
+        '.roads{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}'
+        '.roads line{stroke:rgba(255,244,214,.4);stroke-width:1.5;vector-effect:non-scaling-stroke}'
+        '.roads line.ms{stroke:rgba(255,244,214,.85);stroke-width:6;stroke-linecap:round}'
         '.ct{position:absolute;transform:translate(-50%,-110%);text-align:center;line-height:1;cursor:default}'
         '.dot{display:inline-block;width:11px;height:11px;border-radius:50%;border:2px solid #fff;'
         'box-shadow:0 0 4px rgba(0,0,0,.8)}'
         '.lb{display:block;margin-top:2px;font-size:12px;font-weight:700;color:#fff;'
         'text-shadow:0 0 3px #000,0 0 3px #000}</style>'
-        f'<div class="mapwrap"><img src="data:image/png;base64,{img}">{"".join(marks)}</div>',
+        f'<div class="mapwrap"><img src="data:image/png;base64,{img}">{roads}{"".join(marks)}</div>',
         unsafe_allow_html=True)
     st.caption("마커 색 = 현재 소유 세력(그림 성채 색은 개전 시점). 마커에 마우스를 올리면 상세.")
 
