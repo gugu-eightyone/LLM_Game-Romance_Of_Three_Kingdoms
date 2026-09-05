@@ -100,12 +100,22 @@ def test_turn_judge_length_mismatch_falls_back(monkeypatch):
     assert calls["single"] == 1
 
 
-def test_turn_judge_single_item_uses_legacy_path(monkeypatch):
+def test_turn_judge_single_item_also_batched(monkeypatch):
+    """⭐2026-09-06 계약 변경(유령 장수 대조): 단건도 일괄 경로 — 호출 수 동일(1회)하되
+    채점 줄의 투입장수 명단을 심판이 보게 된다."""
     s = _state()
     fake, calls = _fake_llm([9])
     monkeypatch.setattr(decide, "structured_complete", fake)
     judge = decide.turn_judge(s, {"촉": [Domestic(kind="내정", city="성도", item="모병",
                                                   gold_spent=1000, strategy="정예 위주 소수 모병")]})
-    assert calls["batch"] == 0                          # 단건=일괄 호출 안 함(기존 거동)
-    assert judge(s, "촉", "내정", "정예 위주 소수 모병")[0] == 5
-    assert calls["single"] == 1
+    assert calls["batch"] == 1                          # 단건도 일괄 1호출(총 호출 수 무변)
+    assert judge(s, "촉", "내정", "정예 위주 소수 모병") == (9, "r")   # 캐시 적중
+    assert calls["single"] == 0
+
+
+def test_battle_ctx_exposes_committed_generals():
+    """유령 장수 대조 재료: 채점 줄에 투입장수 명단이 박힌다(⭐2026-09-06 사용자 발견 수리)."""
+    acts = {"촉": [Battle(kind="전투", mode="공성", origin="성도", target="낙양",
+                          troops=4000, generals=["조운"], strategy="북벽 강습")]}
+    (_, items), = decide._judged_texts(acts).items()
+    assert "투입장수[조운]" in items[0][1]

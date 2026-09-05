@@ -23,7 +23,7 @@ from .models import (
 # 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
 from .config import (
     ALLIANCE_DEFAULT_MONTHS, ATTRITION_RATE, CAPTURE_FLOOR, CITY_INCOME_FOOD, CITY_INCOME_GOLD,
-    DEFAULT_SPEED, DOMESTIC_GAIN, DOMESTIC_MODIFIER_BOUND, ESCORT_MIN_TROOPS,
+    DEFAULT_SPEED, DOMESTIC_GAIN, DOMESTIC_MODIFIER_BOUND, ESCORT_MIN_TROOPS, LEADERLESS_COMBAT_MULT,
     GARRISON_TROOPS_PER_FOOD, STRANDED_DESERTION,
     RECRUIT_CURVE_SCALE, STRATEGY_MODIFIER_BOUND, TROOPS_PER_FOOD,
     FACTION_SPEED, FIELD_CAPTURE_BASE, FIELD_RETREAT_LOSS, GENERAL_SCALE,
@@ -127,7 +127,10 @@ def _power(state: GameState, troops: int, generals: list[str], morale: int = 50)
     cmds = [state.generals[g].command for g in generals if g in state.generals]
     bonus = max(cmds) if cmds else 0
     morale_factor = 1 + (morale - 50) / 50 * MORALE_COMBAT_BAND
-    return troops * (1 + bonus / GENERAL_SCALE) * morale_factor
+    # ⭐무지휘 디메리트(사용자 2026-09-06): 장수 없는 진영은 ×LEADERLESS_COMBAT_MULT(0.8).
+    # 로스터 밖 이름만 있는 경우(cmds 빈 리스트)도 무지휘로 침 — 유령 지휘관 무보상.
+    leaderless = LEADERLESS_COMBAT_MULT if not cmds else 1.0
+    return troops * (1 + bonus / GENERAL_SCALE) * morale_factor * leaderless
 
 
 class Force(NamedTuple):
@@ -534,6 +537,7 @@ def _advance_movement(state: GameState) -> None:
     마일스톤은 노드로 만들지 않음 — 위치=`(origin,target,progress)`. 충돌은 `_resolve_combat`이 술어로 판정.
     """
     engaged = _field_engaged_ids(state)
+    arrivals: list[ActiveOperation] = []
     for op in list(state.operations):
         if op.stage != "이동" or op.id in engaged:
             continue
@@ -551,7 +555,20 @@ def _advance_movement(state: GameState) -> None:
                 f"{hold}개월 지점 도착 — 길목 대기(지나가는 적 자동 요격, 해제=회군)")
             continue
         if op.progress >= op.threshold:
-            _arrive(state, op)
+            arrivals.append(op)                          # 도착은 전 부대 이동 반영 후 일괄 판정(아래)
+    # ⭐엇갈림 방지(2026-09-06, 사용자 발견): 같은 간선을 반대방향으로 지나던 두 부대가 "같은 턴에
+    # 한쪽이 도착"하면 교차 술어(둘 다 이동 중)에서 빠져 서로 스쳐 지나갔다(유령 통과 — 오 공성군과
+    # 마주 나온 위 공성군이 안 싸우고 목적지를 맞바꾼 실플레이 사례). 이동 반영 후 기준으로 조우가
+    # 성립하는 도착은 이번 턴 보류 — 같은 턴 전투 해소가 길 위 교전으로 처리하고, 상대가 사라진
+    # 다음 턴에 도착한다. (보류 중 넘친 진행 잉여가 prep으로 새지만 캡 0.10 아래 — "돌파 기세"로 수용.)
+    meet = _field_engaged_ids(state)
+    for op in arrivals:
+        if op.id in meet:
+            state.history.append(
+                f"[작전{op.id}] {op.faction} {op.action.origin}–{op.action.target} "
+                f"길에서 적과 조우 — 도착 보류(교전 우선)")
+            continue
+        _arrive(state, op)
 
 
 def _arrive(state: GameState, op: ActiveOperation) -> None:
@@ -578,22 +595,22 @@ def _arrive(state: GameState, op: ActiveOperation) -> None:
         city.prisoners.extend(op.cargo_prisoners)
         city.gold += op.cargo_gold
         city.food += op.cargo_food
-        # ⭐왕복 호송(D묶음): 하역 후 호위 장수만 빈 몸으로 복귀 — 같은 간선을 되짚는다(요격 노출 2배=자연 비용).
+        # ⭐왕복 호송(D묶음): 하역 후 호위 장수만 빈 몸으로 복귀. 귀로=**개인 이동으로 전환**
+        # (⭐사용자 2026-09-06: 빈 몸 장수의 귀로는 장수 단독 이동과 같은 처지 — 요격·전투·포획 면제 재사용).
         if getattr(op.action, "round_trip", False) and op.committed_generals:
             city.generals = [g for g in city.generals if g not in op.committed_generals]
+            home, there = op.action.origin, op.action.target
+            op.action = Travel(kind="개인이동", origin=there, target=home,
+                               general=op.committed_generals[0])
             op.committed_troops = 0
             op.cargo_gold = op.cargo_food = 0
             op.cargo_prisoners = []
-            op.action.origin, op.action.target = op.action.target, op.action.origin
-            op.action.round_trip = False              # 복귀 다리는 편도(무한 왕복 방지)
+            op.path = [there, home]
             op.progress = 0
-            back = float(state.distances[op.action.origin][op.action.target])
-            if _is_river(state, op.action.origin, op.action.target) and op.faction != "오":
-                back += RIVER_CROSS_PENALTY
-            op.threshold = back
+            op.threshold = float(state.distances[there][home])
             state.history.append(
                 f"[작전{op.id}] {op.faction} 호송 {city.name} 도착·하역 — "
-                f"호위 장수 {','.join(op.committed_generals)} 복귀 개시({back:g}개월)")
+                f"호위 장수 {','.join(op.committed_generals)} 복귀 개시({op.threshold:g}개월, 전투 면제)")
             return
         state.history.append(f"[작전{op.id}] {op.faction} 호송 {city.name} 도착")
         state.operations.remove(op)

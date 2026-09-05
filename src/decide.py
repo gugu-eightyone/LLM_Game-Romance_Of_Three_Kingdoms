@@ -55,7 +55,10 @@ def _judged_texts(actions: dict) -> dict[tuple[str, str], list[tuple[str, str]]]
             if not text:
                 continue
             if a.kind == "전투":
-                ctx = f"{a.mode} {a.origin}→{a.target} 병{a.troops}"
+                # ⭐투입 장수 노출(2026-09-06, 사용자 발견): 전략문이 부대에 없는 장수에게 역할을 주는
+                # "유령 장수" 계획을 심판이 글만 보고 수긍 → 명단을 채점 줄에 박아 대조 가능하게.
+                ctx = (f"{a.mode} {a.origin}→{a.target} 병{a.troops} "
+                       f"투입장수[{','.join(a.generals) if a.generals else '없음'}]")
             elif a.kind == "작전지시" and a.order == "전략변경":
                 ctx = f"작전{a.op_id} 전략변경"
             elif a.kind == "내정":
@@ -71,13 +74,14 @@ def turn_judge(state: GameState, actions: dict):
 
     분할 협공이 낱개 병력으로 "과장" 삼중 감점되던 문맥 결손 해소 + 호출 N→1. 엔진 JudgeFn과
     호환되는 콜백을 돌려줌(엔진 무변). 채점 상태=턴 시작 brief(행위자 정보 집합과 동일 — 상대
-    같은 턴 숨은 수는 의도적으로 안 봄, 카운터는 상성 판정·전략변경 재채점 몫). 단건·캐시 미스·
-    실패·길이 불일치는 기존 단건 action_judge로 폴백(악화 없음).
+    같은 턴 숨은 수는 의도적으로 안 봄, 카운터는 상성 판정·전략변경 재채점 몫). 캐시 미스·
+    실패·길이 불일치는 기존 단건 action_judge로 폴백(악화 없음). 단건도 일괄 경로(투입장수 노출).
     """
     cache: dict[tuple[str, str, str], tuple[int, str]] = {}
     for (faction, kind), items in _judged_texts(actions).items():
-        if len(items) < 2:                            # 단건=기존 경로와 동일 거동
-            continue
+        if not items:
+            continue                                  # ⭐단건도 일괄 경로로(2026-09-06): 호출 수 동일(1회),
+                                                      # ctx의 투입장수 명단을 심판이 보게 됨(유령 장수 대조)
         listing = "\n".join(f"{i}. ({ctx}) 「{t}」" for i, (t, ctx) in enumerate(items, 1))
         try:
             v = structured_complete(
@@ -88,8 +92,8 @@ def turn_judge(state: GameState, actions: dict):
                 f"scores 배열은 번호 순서대로]\n{listing}")
         except LLMError:
             continue
-        if len(v.scores) != len(items):
-            continue                                  # 배열 길이 불일치 → 단건 폴백(안전)
+        if v is None or len(v.scores) != len(items):
+            continue                                  # 응답 없음/길이 불일치 → 단건 폴백(안전)
         for (t, _), sc in zip(items, v.scores):
             cache[(faction, kind, t)] = (sc.score, sc.reason)
 

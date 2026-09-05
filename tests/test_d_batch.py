@@ -66,6 +66,38 @@ def test_hold_clamped_into_range():
     assert any("클램프" in h for h in s.history)
 
 
+# ======================= 무지휘 디메리트 (⭐사용자 2026-09-06 "장수 없으면 x0.8") =======================
+def test_leaderless_force_fights_weaker():
+    from src.config import LEADERLESS_COMBAT_MULT
+    from src.engine import _power
+    s = _state()                                        # 로스터엔 마초 없음 → 유령 이름도 무지휘 취급
+    base = _power(s, 10000, [], morale=50)
+    assert base == 10000 * LEADERLESS_COMBAT_MULT
+    assert _power(s, 10000, ["유령장수"], morale=50) == base   # 로스터 밖 이름=무보상·무지휘
+
+
+# ======================= 회귀: 엇갈림(유령 통과) 방지 (2026-09-06 실플레이 발견) =======================
+def test_no_ghost_passthrough_on_same_edge():
+    """같은 간선 반대방향 진군 중 한쪽이 도착하는 턴 — 스쳐 지나가지 않고 길에서 교전해야 한다.
+
+    실사례: 오 강하→양양 공성 진군 중, 위가 양양→강하로 마주 출격 → 오가 도착 턴에 교차 술어
+    (둘 다 이동 중)에서 빠져 유령 통과, 양양 함락 + 위군 고립. 수리=조우 성립 시 도착 보류.
+    """
+    s = _state()
+    s.operations.append(ActiveOperation(
+        id=1, faction="촉", stage="이동", progress=1.5, threshold=2, committed_troops=9000,
+        action=Battle(kind="전투", mode="공성", origin="한중", target="장안", troops=9000)))
+    s.operations.append(ActiveOperation(
+        id=2, faction="위", stage="이동", progress=0.0, threshold=2, committed_troops=9000,
+        action=Battle(kind="전투", mode="공성", origin="장안", target="한중", troops=9000)))
+    s.next_op_id = 3
+    advance_turn(s, [])                                 # 촉 2.5(도착권) ↔ 위 1.0 — 진행합 3.5 ≥ 거리 2
+    assert any("도착 보류" in h for h in s.history)
+    assert any("[야전]" in h for h in s.history)        # 같은 턴에 길 위 교전 발생
+    assert s.cities["장안"].owner == "위"               # 유령 통과 공성 없음
+    assert not any("공성 개시" in h for h in s.history)
+
+
 # ======================= 회군 무료 (마찰 23) =======================
 def test_withdraw_is_free_of_order_cap():
     s = _state()
@@ -146,7 +178,8 @@ def test_round_trip_unloads_and_escort_returns():
     assert "마초" not in s.cities["장안"].generals      # ⭐장수는 안 내림(왕복)
     back = s.operations[0]
     assert back.action.origin == "장안" and back.action.target == "한중"
-    assert back.committed_troops == 0 and not back.action.round_trip   # 빈 몸·편도
+    assert back.committed_troops == 0
+    assert back.action.mode == "개인이동"              # ⭐귀로=개인 이동 전환(요격·포획 면제, 2026-09-06)
     advance_turn(s, [])
     advance_turn(s, [])
     assert s.operations == [] and "마초" in s.cities["한중"].generals  # 호위 장수 귀환

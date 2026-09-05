@@ -32,14 +32,15 @@ def test_wall_bonus_capped_by_manning():
     # 빈 성: 병력 0이면 성벽 보너스도 0 (빈 성벽 혼자 못 싸움)
     _, _, dom_empty = _combat_round(s, Force(10000, []), Force(0, [], wall=3))
     assert dom_empty == 999.0                        # 수비 전투력 완전 0
-    # 부분 정원: 병력 500·벽3 → min(3, 0.5)=0.5레벨만 위력
-    ap = 10000
-    _, _, dom_partial = _combat_round(s, Force(ap, []), Force(500, [], wall=3))
-    expected_bp = 500 + 0.5 * WALL_DEFENSE
+    # 부분 정원: 병력 500·벽3 → min(3, 0.5)=0.5레벨만 위력 (양측 무장수=×무지휘 배수, ⭐2026-09-06)
+    from src.config import LEADERLESS_COMBAT_MULT as M
+    ap = 10000 * M
+    _, _, dom_partial = _combat_round(s, Force(10000, []), Force(500, [], wall=3))
+    expected_bp = 500 * M + 0.5 * WALL_DEFENSE
     assert abs((ap / expected_bp - 1) - dom_partial) < 1e-9
     # 정상 케이스: 정원 충족(병력 ≥ wall×MANNING)이면 종전과 동일한 만액 보너스
-    _, _, dom_full = _combat_round(s, Force(ap, []), Force(3 * WALL_MANNING, [], wall=3))
-    expected_bp_full = 3 * WALL_MANNING + 3 * WALL_DEFENSE
+    _, _, dom_full = _combat_round(s, Force(10000, []), Force(3 * WALL_MANNING, [], wall=3))
+    expected_bp_full = 3 * WALL_MANNING * M + 3 * WALL_DEFENSE
     assert abs((ap / expected_bp_full - 1) - dom_full) < 1e-9
 
 

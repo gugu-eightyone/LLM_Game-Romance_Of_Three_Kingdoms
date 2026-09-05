@@ -1,0 +1,9 @@
+# ⭐다크 기본 + 목업 v18 팔레트 고정(사용자 2026-09-05 "아예 맞추자").
+# C묶음 카드 UI(docs/mockups/c_ui_mockup.html)의 :root 토큰과 동일 축 — 위젯도 같은 톤을 받게
+# 테마 변수로 내리고, 테마가 못 만지는 세부(버튼 곡률·serif 등)만 app.py _CSS가 주입한다.
+[theme]
+base = "dark"
+primaryColor = "#d4a94e"              # gold 액센트(포커스·선택 상태)
+backgroundColor = "#0e1117"           # --bg
+secondaryBackgroundColor = "#1d212b"  # --panel2 (입력 위젯·사이드바 바탕)
+textColor = "#e8e6e3"                 # --tx
