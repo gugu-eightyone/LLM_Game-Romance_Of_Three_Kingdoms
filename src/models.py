@@ -187,6 +187,7 @@ class Diplomacy(BaseModel):
     prisoner: str = ""                           # 포로반환: 되사올 우리 장수
     offer_gold: int = 0                          # 포로반환 몸값(금)
     offer_food: int = 0                          # 포로반환 몸값(식량)
+    pay_city: str = ""                           # ⭐몸값 지불 도시 지정(2026-09-05, 플레이어 UI용). 빈 값=자동(최대 보유 도시)
     envoy: str = ""                              # 사신 장수(지정만 — 서사·C층 재료, 기계 효과 없음)
     message: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
 
@@ -200,6 +201,7 @@ class Proposal(BaseModel):
     prisoner: str = ""
     offer_gold: int = 0
     offer_food: int = 0
+    pay_city: str = ""                           # 몸값 지불 도시(빈 값=자동)
     envoy: str = ""
     message: str = ""
 

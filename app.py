@@ -512,14 +512,19 @@ def order_builder() -> None:
                 months = st.number_input("기한(개월)" + (f" — 현재 잔여 {left_m}개월" if left_m else ""),
                                          1, 60, 12, key="dp_mo",
                                          help="만료=자동 해소(명예 종료, 배신 아님). 연장 수락 시 이 기한으로 재설정.")
-            prisoner, og, of = "", 0, 0
+            prisoner, og, of, pay_city = "", 0, 0, ""
             if prop == "포로반환":
                 prisoner = st.selectbox("되찾을 장수", my_captured, key="dp_pr")
-                # 몸값=자국 최대 보유 도시에서 지불(엔진) — 큐에 담긴 몸값 합을 근사 차감
+                my_cities = [c.name for c in s.cities.values() if c.owner == player]
+                pick = st.selectbox("몸값 지불 도시", ["자동(최대 보유 도시)"] + my_cities, key="dp_pc")
+                pay_city = "" if pick.startswith("자동") else pick
                 r_g = sum(getattr(a, "offer_gold", 0) for a in q if a.kind == "외교")
                 r_f = sum(getattr(a, "offer_food", 0) for a in q if a.kind == "외교")
-                max_g = max(0, max((c.gold for c in s.cities.values() if c.owner == player), default=0) - r_g)
-                max_f = max(0, max((c.food for c in s.cities.values() if c.owner == player), default=0) - r_f)
+                base_g = (s.cities[pay_city].gold if pay_city
+                          else max((c.gold for c in s.cities.values() if c.owner == player), default=0))
+                base_f = (s.cities[pay_city].food if pay_city
+                          else max((c.food for c in s.cities.values() if c.owner == player), default=0))
+                max_g, max_f = max(0, base_g - r_g), max(0, base_f - r_f)
                 og = st.number_input(f"몸값 금 (지불 가능 {max_g:,})", 0, max_g, 0, key="dp_g")
                 of = st.number_input(f"몸값 식량 (지불 가능 {max_f:,})", 0, max_f, 0, key="dp_f")
             envoy, msg = "", ""
@@ -534,7 +539,7 @@ def order_builder() -> None:
                     kind="외교", target_faction=t,
                     proposal="동맹" if prop == "연장" else prop,   # 연장=동맹 재제안(엔진 규약)
                     months=int(months), prisoner=prisoner,
-                    offer_gold=int(og), offer_food=int(of), envoy=envoy, message=msg))
+                    offer_gold=int(og), offer_food=int(of), pay_city=pay_city, envoy=envoy, message=msg))
                 _clear_inputs("dp_m", "dp_g", "dp_f")
                 st.rerun()
 

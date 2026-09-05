@@ -196,6 +196,14 @@ def brief(state: GameState, faction: FactionName) -> str:
              + (f", 동맹={','.join(allies)}" if allies else ", 동맹=없음(파기 불가)"),
              "[우리 도시]", *[_city_line(state, n, True) for n in mine],
              "[타 세력 도시]", *[_city_line(state, n, False) for n in other]]
+    # ⭐아군 피랍 결론 박기(2026-09-05): 타 세력 감옥의 우리 장수 — 소유 대조·동사 연결을 추론시키지 않는다
+    # (자국 공성·파기 환각과 같은 수리 패턴. 피랍 없으면 줄 자체가 없음=토큰 0)
+    captives = [(p, n) for n, c in state.cities.items() if c.owner != faction
+                for p in c.prisoners if state.generals.get(p) and state.generals[p].faction == faction]
+    if captives:
+        lines.append("[아군 피랍] "
+                     + ", ".join(f"{p}({state.cities[n].owner} {n} 수감)" for p, n in captives)
+                     + " — 외교 '포로반환'(몸값 제시)으로 송환 요청 가능")
     if state.chronicle:                              # 주요 연혁 전량(굵직한 것만이라 짧음) — 원한·대세 기억용
         lines += ["[주요 연혁]", *[f"- {c}" for c in state.chronicle]]
     if state.operations:

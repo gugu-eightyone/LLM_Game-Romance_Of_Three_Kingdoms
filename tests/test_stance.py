@@ -185,6 +185,21 @@ def test_capture_no_survivors_when_encircled():
     assert not any("잔병" in h for h in s.history)
 
 
+def test_sortie_slow_is_squared():
+    """감속=(출성비)² 볼록 곡선(⭐2026-09-05) — 절반 규모 출성이면 제곱이라 ~20%대(선형이면 ~45%)."""
+    import re
+    s = _mini_state()
+    _besiege(s)
+    siege = s.operations[0]
+    siege.committed_troops = 8000
+    start_operation(s, Battle(kind="전투", mode="야전", origin="한중", target="한중", troops=4000))
+    advance_turn(s, [])
+    pcts = [int(m.group(1)) for h in s.history for m in [re.search(r"출성 견제 −(\d+)%", h)] if m]
+    assert pcts, "출성 견제 로그가 없다"
+    # 같은 턴 야전 손실로 라운드 시점 비율은 ~0.45 — 제곱이면 20%대, 선형(버그 회귀)이면 40%대.
+    assert all(10 <= p < 35 for p in pcts), pcts
+
+
 def test_sortie_slow_cap():
     """감속은 캡까지만 — 대군 출성이라도 공성이 완전 정지하지는 않는다(설계: 감속≠정지)."""
     assert 0 < SORTIE_SLOW_CAP < 1

@@ -555,7 +555,8 @@ def _siege_round(state: GameState, op: ActiveOperation) -> None:
     sortie_troops = sum(o.committed_troops for o in state.operations
                         if o.faction == city.owner and o.stage == "교전"
                         and o.action.mode == "야전" and o.action.origin == o.action.target == op.action.target)
-    slow = min(SORTIE_SLOW_CAP, sortie_troops / op.committed_troops) if sortie_troops and op.committed_troops > 0 else 0.0
+    # 감속 = (출성비)² 볼록 곡선(⭐2026-09-05): 찔끔 출성의 저투입 효율 차단 — 포획확률 포위도²와 같은 문법.
+    slow = min(SORTIE_SLOW_CAP, (sortie_troops / op.committed_troops) ** 2) if sortie_troops and op.committed_troops > 0 else 0.0
     dmg = max(0, round(dominance * SIEGE_RATE * WALL_HP_SCALE * (1 - slow)))
     city.wall_hp = max(0, _wall_hp(city) - dmg)
     slow_note = f", 출성 견제 −{slow:.0%}" if slow else ""
@@ -1141,14 +1142,22 @@ def apply_diplomacy(state: GameState, action: Diplomacy, actor: str | None = Non
             state.history.append(
                 f"[환각] {me} 반환 요청 무효('{action.prisoner}'는 {t} 수감 중인 아군 아님) → 기각")
             return
-        pay_g = max((c.gold for c in state.cities.values() if c.owner == me), default=0)
-        pay_f = max((c.food for c in state.cities.values() if c.owner == me), default=0)
+        pay_city = getattr(action, "pay_city", "")    # ⭐지불 도시 지정(플레이어 UI). 무효 지정=자동으로 강등
+        if pay_city and (pay_city not in state.cities or state.cities[pay_city].owner != me):
+            state.history.append(f"[환각] {me} 몸값 지불 도시 '{pay_city}' 무효(타국/부재) → 자동 선택")
+            pay_city = ""
+        if pay_city:
+            pay_g, pay_f = state.cities[pay_city].gold, state.cities[pay_city].food
+        else:
+            pay_g = max((c.gold for c in state.cities.values() if c.owner == me), default=0)
+            pay_f = max((c.food for c in state.cities.values() if c.owner == me), default=0)
         if action.offer_gold > pay_g or action.offer_food > pay_f:
-            state.history.append(f"[기각] {me} 몸값(금{action.offer_gold}·식{action.offer_food}) 지불 여력 부족")
+            state.history.append(f"[기각] {me} 몸값(금{action.offer_gold}·식{action.offer_food}) 지불 여력 부족"
+                                 + (f" ({pay_city} 기준)" if pay_city else ""))
             return
         state.proposals.append(Proposal(
             from_faction=me, to_faction=t, proposal="포로반환", prisoner=action.prisoner,
-            offer_gold=action.offer_gold, offer_food=action.offer_food,
+            offer_gold=action.offer_gold, offer_food=action.offer_food, pay_city=pay_city,
             envoy=envoy, message=action.message))
         state.history.append(
             f"[외교] {me}, {t}에 {action.prisoner} 반환 요청(몸값 금{action.offer_gold}·식{action.offer_food})")
@@ -1239,8 +1248,13 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
     # 포로반환
     jail = next((c for c in state.cities.values()
                  if c.owner == b and prop.prisoner in c.prisoners), None)
-    payer_g = max((c for c in state.cities.values() if c.owner == a), key=lambda c: c.gold, default=None)
-    payer_f = max((c for c in state.cities.values() if c.owner == a), key=lambda c: c.food, default=None)
+    # ⭐지불 도시 지정 시 그 도시에서 금·식량 모두 지불(수락 시점에 함락 등으로 무효면 자동 선택으로 강등)
+    named = state.cities.get(prop.pay_city)
+    if named is not None and named.owner == a:
+        payer_g = payer_f = named
+    else:
+        payer_g = max((c for c in state.cities.values() if c.owner == a), key=lambda c: c.gold, default=None)
+        payer_f = max((c for c in state.cities.values() if c.owner == a), key=lambda c: c.food, default=None)
     if (jail is None or payer_g is None or payer_g.gold < prop.offer_gold
             or payer_f is None or payer_f.food < prop.offer_food):
         state.history.append(f"[외교] {prop.prisoner} 반환 무산(포로 부재 또는 몸값 여력 소진)")

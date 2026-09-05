@@ -158,6 +158,35 @@ def test_ransom_fizzles_if_prisoner_gone_at_response():
     assert any("무산" in h for h in s.history)
 
 
+def test_ransom_pay_city_and_brief_captive_line():
+    """⭐2026-09-05: 몸값 지불 도시 지정=그 도시에서만 차감 + brief [아군 피랍] 결론 줄(없으면 줄 자체 없음)."""
+    from src.decide import brief
+    s = _state()
+    s.cities["강주"] = City(name="강주", owner="촉", troops=1000, gold=1500, food=2000)
+    s.cities["건업"].prisoners.append("조운")
+    s.cities["성도"].generals.remove("조운")
+    text = brief(s, "촉")
+    assert "[아군 피랍]" in text and "조운(오 건업 수감)" in text and "포로반환" in text
+    assert "[아군 피랍]" not in brief(s, "위")
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="포로반환",
+                                 prisoner="조운", offer_gold=1000, pay_city="강주"), actor="촉")
+    assert respond_proposal(s, s.proposals[0], True) is True
+    assert s.cities["강주"].gold == 500 and s.cities["성도"].gold == 3000   # 지정 도시만 차감(자동이면 성도)
+
+
+def test_ransom_pay_city_insufficient_or_invalid():
+    s = _state()
+    s.cities["강주"] = City(name="강주", owner="촉", troops=1000, gold=500, food=100)
+    s.cities["건업"].prisoners.append("조운")
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="포로반환",
+                                 prisoner="조운", offer_gold=1000, pay_city="강주"), actor="촉")
+    assert not s.proposals and any("강주 기준" in h for h in s.history)     # 지정 도시 기준으로 여력 검증
+    apply_diplomacy(s, Diplomacy(kind="외교", target_faction="오", proposal="포로반환",
+                                 prisoner="조운", offer_gold=1000, pay_city="건업"), actor="촉")
+    assert len(s.proposals) == 1 and s.proposals[0].pay_city == ""          # 타국 도시 지정=자동 강등
+    assert any("[환각]" in h and "지불 도시" in h for h in s.history)
+
+
 def test_imprison_disposition_keeps_prisoner():
     s = _state()
     s.cities["건업"].prisoners.append("조운")
