@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, create_model
 from .config import FOOD_ALERT_MONTHS, SIEGE_BASE, STRATEGY_MAX_CHARS, WALL_HP_SCALE
 from .llm import LLMError, structured_complete
 from .models import (Action, Battle, Diplomacy, Dispose, Domestic, FactionName,
-                     GameState, OpCommand, Persuade, Scheme, Transfer)
+                     GameState, OpCommand, Persuade, Scheme, Transfer, Travel)
 from .prompts import load as load_prompt
 
 
@@ -211,6 +211,9 @@ def brief(state: GameState, faction: FactionName) -> str:
         # 동행 장수 표기: 출전 장수는 도시 줄에서 빠지므로 여기 안 적으면 LLM 눈에 증발 → 미보유 재지정 환각
         lines += [f"- [{o.id}] {o.faction} {o.action.origin}→{o.action.target} {o.action.mode}"
                   + (f" 교전 중" if o.stage == "교전"     # 공성 게이지=도시 줄의 성벽 파손 표기(HP화)
+                     # ⭐길목 대기(D묶음): 지점 사수 중임을 결론으로 박음(재출격·회군 판단 재료)
+                     else f" {o.action.origin}–{o.action.target} {o.action.hold_at}개월 지점 대기 중"
+                     if getattr(o.action, "hold_at", 0) and o.progress >= o.action.hold_at
                      else f" 이동 {o.progress:g}/{o.threshold:g}")
                   + f" 병력{o.committed_troops} 사기{o.unit_morale}"
                   + (f" 전략보정{o.strategy_mod:+.0%}" if o.strategy_mod else "")
@@ -254,7 +257,7 @@ def _decision_model(state: GameState, faction: FactionName) -> type[Decision]:
             city=(Literal[name], ...),
             general=(Literal[tuple(c.generals) + ("",)], ""),   # ""=미지정(배수 1.0)
         ))
-    union = Union[tuple(battles + doms) + (Scheme, Transfer, OpCommand, Diplomacy, Persuade, Dispose)]
+    union = Union[tuple(battles + doms) + (Scheme, Transfer, Travel, OpCommand, Diplomacy, Persuade, Dispose)]
     return create_model("DynDecision", __base__=Decision, actions=(list[union], ...))
 
 

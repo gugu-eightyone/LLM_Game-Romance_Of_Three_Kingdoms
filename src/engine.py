@@ -17,7 +17,7 @@ from typing import Callable, NamedTuple
 
 from .models import (
     ActiveOperation, Battle, City, Diplomacy, Dispose, Domestic, GameState, OpCommand,
-    Persuade, Proposal, Scheme, Transfer,
+    Persuade, Proposal, Scheme, Transfer, Travel,
 )
 
 # 캘리브레이션 상수 = config.py로 분리(튜닝 손잡이 한 곳). 여긴 로직만.
@@ -266,6 +266,16 @@ def start_operation(state: GameState, action: Battle, actor: str | None = None,
         river = _is_river(state, action.origin, action.target)
         if river and faction != "오":      # 위·촉 도하 지연(오는 수전이라 면제)
             dist += RIVER_CROSS_PENALTY
+    # ⭐길목 대기(D묶음): 야전 전용, 지점=1~거리−1(그래프 거리 기준=마일스톤 수). 범위 밖=클램프+로깅.
+    if action.hold_at:
+        cap = int(state.distances[action.origin][action.target]) - 1 if not sortie else 0
+        if action.mode != "야전" or sortie or cap < 1:
+            state.history.append(f"[환각] {faction} 길목 대기는 거리 2+ 야전만 — hold_at 무시")
+            action.hold_at = 0
+        elif not (1 <= action.hold_at <= cap):
+            fixed = max(1, min(cap, action.hold_at))
+            state.history.append(f"[환각] {faction} 대기 지점 {action.hold_at} 범위 밖(1~{cap}) → {fixed}로 클램프")
+            action.hold_at = fixed
     fac = state.factions.get(faction)
     op = ActiveOperation(
         id=state.next_op_id, faction=faction, action=action,
@@ -278,7 +288,8 @@ def start_operation(state: GameState, action: Battle, actor: str | None = None,
     if sortie:
         state.history.append(f"[작전{op.id}] {faction} {action.origin} 출성(성 앞 포진, 병력 {committed})")
     else:
-        tag = "·도하" if river else ""
+        tag = ("·도하" if river else "") \
+            + (f"·{action.origin}–{action.target} {action.hold_at}개월 지점 대기 예정" if action.hold_at else "")
         state.history.append(
             f"[작전{op.id}] {faction} {action.origin}→{action.target} 진군 개시(거리 {dist:g}개월{tag}, 병력 {committed})")
     _judge_strategy(state, op, judge)                 # ⭐전략 채점(출격 시 1회) → 전투 보정+가시화
@@ -420,6 +431,76 @@ def start_transfer(state: GameState, action: Transfer, actor: str | None = None)
     return op
 
 
+# ======================= 개인 이동 (장수 단독 · 아군 영토 경유 · 완전 면제) =======================
+def travel_path(state: GameState, faction: str, origin: str, target: str) -> tuple[list[str], int] | None:
+    """아군 도시만 잇는 최단 경로(다익스트라)와 소요 개월(구간 합). 경로 없음=None.
+
+    ⭐개인 이동(D묶음): 잠입(적 영토 경유)은 기각 — 경로 자체가 아군 영토여야 한다. UI·엔진 공용.
+    """
+    if origin == target:
+        return None
+    ok = lambda n: n in state.cities and state.cities[n].owner == faction
+    if not (ok(origin) and ok(target)):
+        return None
+    dist = {origin: 0}
+    prev: dict[str, str] = {}
+    todo = {origin}
+    while todo:
+        cur = min(todo, key=lambda n: dist[n])
+        todo.remove(cur)
+        if cur == target:
+            break
+        for nb, d in state.distances.get(cur, {}).items():
+            if not ok(nb):
+                continue
+            nd = dist[cur] + d
+            if nd < dist.get(nb, 1 << 30):
+                dist[nb] = nd
+                prev[nb] = cur
+                todo.add(nb)
+    if target not in dist:
+        return None
+    path = [target]
+    while path[-1] != origin:
+        path.append(prev[path[-1]])
+    return path[::-1], dist[target]
+
+
+def start_travel(state: GameState, action: Travel, actor: str | None = None) -> ActiveOperation | None:
+    """⭐개인 이동 개시(D묶음 2026-09-05): 장수 한 명, 아군 영토 최단 경로, 요격·전투·포획 완전 면제.
+
+    경로는 출발 시 고정(경유지 함락=무사 계속 진행). 목적지 함락=도착 시 무사 회군. 병량 0(병력 0).
+    """
+    origin = state.cities.get(action.origin)
+    if origin is None:
+        state.history.append(f"[기각] 출발도시 '{action.origin}' 없음")
+        return None
+    faction = origin.owner
+    if actor is not None and faction != actor:
+        state.history.append(f"[위반] {actor}가 남의 도시 '{action.origin}'({faction})에서 개인 이동 시도 → 기각")
+        return None
+    if not action.general or action.general not in origin.generals:
+        state.history.append(f"[환각] {faction} 개인 이동 장수 '{action.general}' 미보유/타지 → 기각")
+        return None
+    found = travel_path(state, faction, action.origin, action.target)
+    if found is None:
+        state.history.append(
+            f"[기각] {faction} 개인 이동 {action.origin}→{action.target} — 아군 영토 경로 없음(적 영토 경유 불가)")
+        return None
+    path, months = found
+    origin.generals.remove(action.general)
+    op = ActiveOperation(
+        id=state.next_op_id, faction=faction, action=action,
+        stage="이동", progress=0, threshold=float(months),
+        committed_troops=0, committed_generals=[action.general], path=path,
+    )
+    state.next_op_id += 1
+    state.operations.append(op)
+    state.history.append(
+        f"[작전{op.id}] {faction} {action.general} 개인 이동 {'→'.join(path)} (소요 {months}개월, 전투 면제)")
+    return op
+
+
 # ======================= 작전지시 (진행 중 작전 제어: 회군·전략변경) =======================
 def apply_op_command(state: GameState, action: OpCommand, actor: str | None = None,
                      judge: JudgeFn | None = None) -> None:
@@ -456,9 +537,19 @@ def _advance_movement(state: GameState) -> None:
     for op in list(state.operations):
         if op.stage != "이동" or op.id in engaged:
             continue
-        if op.action.mode == "야전" and op.has_fought:   # 교전 마친 야전=복귀 대기(전진 안 함)
+        if op.action.mode == "야전" and op.has_fought \
+                and not getattr(op.action, "hold_at", 0):   # 교전 마친 야전=복귀 대기(⭐길목 대기는 지점까지 속행)
+            continue
+        hold = getattr(op.action, "hold_at", 0)          # ⭐길목 대기: 지점 도달=동결(도착 안 함)
+        if hold and op.progress >= hold:
             continue
         op.progress += FACTION_SPEED.get(op.faction, DEFAULT_SPEED)
+        if hold and op.progress >= hold:                 # 잉여는 지점에서 소멸(대기가 목적이라 이월 무의미)
+            op.progress = float(hold)
+            state.history.append(
+                f"[작전{op.id}] {op.faction} {op.action.origin}–{op.action.target} "
+                f"{hold}개월 지점 도착 — 길목 대기(지나가는 적 자동 요격, 해제=회군)")
+            continue
         if op.progress >= op.threshold:
             _arrive(state, op)
 
@@ -470,6 +561,14 @@ def _arrive(state: GameState, op: ActiveOperation) -> None:
         state.history.append(f"[작전{op.id}] 대상 도시 소멸 → 취소")
         state.operations.remove(op)
         return
+    if op.action.mode == "개인이동":                  # ⭐완전 면제 이동: 도착=합류, 목적지 상실=무사 회군
+        if city.owner != op.faction:
+            _return_home(state, op, "개인 이동 취소(목적지 상실)")
+            return
+        city.generals.extend(op.committed_generals)
+        state.history.append(f"[작전{op.id}] {op.faction} {','.join(op.committed_generals)} {city.name} 도착(개인 이동)")
+        state.operations.remove(op)
+        return
     if op.action.mode == "호송":
         if city.owner != op.faction:                  # 이동 중 목적지 함락 → 회군(화물째)
             _return_home(state, op, "호송 취소(목적지 상실)")
@@ -479,6 +578,23 @@ def _arrive(state: GameState, op: ActiveOperation) -> None:
         city.prisoners.extend(op.cargo_prisoners)
         city.gold += op.cargo_gold
         city.food += op.cargo_food
+        # ⭐왕복 호송(D묶음): 하역 후 호위 장수만 빈 몸으로 복귀 — 같은 간선을 되짚는다(요격 노출 2배=자연 비용).
+        if getattr(op.action, "round_trip", False) and op.committed_generals:
+            city.generals = [g for g in city.generals if g not in op.committed_generals]
+            op.committed_troops = 0
+            op.cargo_gold = op.cargo_food = 0
+            op.cargo_prisoners = []
+            op.action.origin, op.action.target = op.action.target, op.action.origin
+            op.action.round_trip = False              # 복귀 다리는 편도(무한 왕복 방지)
+            op.progress = 0
+            back = float(state.distances[op.action.origin][op.action.target])
+            if _is_river(state, op.action.origin, op.action.target) and op.faction != "오":
+                back += RIVER_CROSS_PENALTY
+            op.threshold = back
+            state.history.append(
+                f"[작전{op.id}] {op.faction} 호송 {city.name} 도착·하역 — "
+                f"호위 장수 {','.join(op.committed_generals)} 복귀 개시({back:g}개월)")
+            return
         state.history.append(f"[작전{op.id}] {op.faction} 호송 {city.name} 도착")
         state.operations.remove(op)
         return
@@ -682,7 +798,7 @@ def _field_engagements(state: GameState) -> list[tuple[ActiveOperation, ActiveOp
     ① 같은 간선 반대방향 이동 + progress합 ≥ 거리 → 도로에서 교차(마일스톤 지점).
     ② 같은 도시서 둘 다 교전(공성 op ↔ 그 도시 도착한 구원 op).
     """
-    ops = list(state.operations)
+    ops = [o for o in state.operations if o.action.mode != "개인이동"]   # ⭐개인 이동=요격·전투 완전 면제
     pairs = []
     for i, a in enumerate(ops):
         for b in ops[i + 1:]:
@@ -781,6 +897,9 @@ def _resolve_combat(state: GameState, matchup: "MatchupFn | None" = None) -> Non
         if op.action.mode != "야전" or op.id in engaged or op.committed_troops <= 0:
             continue
         if op.has_fought:
+            # ⭐길목 대기(D묶음): 지점 사수 부대는 요격을 마쳐도 복귀하지 않는다 — 대기가 임무(해제=회군).
+            if getattr(op.action, "hold_at", 0) and op.stage == "이동":
+                continue
             # 출성 포함: 교전이 끝나면 성내 복귀=재정비(⭐사용자 — 성 밖 대기는 수비 분할만 지속.
             # 새 위협에 선타를 원하면 예비 출성 규칙으로 도착 전에 다시 내보내면 된다).
             _return_home(state, op, "요격 완료")
@@ -797,7 +916,7 @@ def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int,
     if op.committed_troops <= 0:
         if n_field > 0:
             _destroy_field_op(state, op, n_field, killer)  # 야전 전멸 → 장수 포획(base×부대수)·화물 노획
-        elif op.action.mode != "호송":               # 장수 단독 호송(병력 0)은 정상 → 계속 간다
+        elif op.action.mode not in ("호송", "개인이동"):   # 장수 단독 호송·개인 이동(병력 0)은 정상 → 계속 간다
             # 격퇴 사기 훅은 안 둠(⭐사기=세력 정신적 무장 → 국지 전투 승패는 제외, 함락/상실/피랍만)
             _return_home(state, op, "격퇴" if op.action.mode == "공성" else "무위", troops=False)
         return
@@ -1369,6 +1488,8 @@ def _dispatch(state: GameState, action, actor: str | None = None,
         start_operation(state, action, actor, judge)  # 공성·야전 모두 진군 작전으로 개시
     elif isinstance(action, Transfer):
         start_transfer(state, action, actor)
+    elif isinstance(action, Travel):                  # ⭐개인 이동(D묶음)
+        start_travel(state, action, actor)
     elif isinstance(action, OpCommand):
         apply_op_command(state, action, actor, judge)
     elif isinstance(action, Diplomacy):
@@ -1411,11 +1532,19 @@ def advance_turn(state: GameState, actions: list | dict,
         per_faction: dict[str, list] = {}
         for actor, acts in actions.items():
             acts = list(acts) if isinstance(acts, list) else [acts]
-            if len(acts) > MAX_ORDERS_PER_TURN:
+            # ⭐회군=무료(D묶음, 마찰 23): 순수 교정이라 상한에서 제외. 전략변경은 상성 재판정을 노리는
+            # 이득 행동이라 유료 유지(무료화하면 매턴 도배가 최적해).
+            kept, billed = [], 0
+            for a in acts:
+                if isinstance(a, OpCommand) and a.order == "회군":
+                    kept.append(a)
+                elif billed < MAX_ORDERS_PER_TURN:
+                    kept.append(a)
+                    billed += 1
+            if len(kept) < len(acts):
                 state.history.append(
-                    f"[환각] {actor} 명령 {len(acts)}건 > 상한 {MAX_ORDERS_PER_TURN} → 초과분 무시")
-                acts = acts[:MAX_ORDERS_PER_TURN]
-            per_faction[actor] = acts
+                    f"[환각] {actor} 명령 {len(acts)}건 > 상한 {MAX_ORDERS_PER_TURN}(회군 제외) → 초과분 무시")
+            per_faction[actor] = kept
         order = list(per_faction)
         state.rng.shuffle(order)
         items = [(actor, a) for phase in (0, 1, 2)

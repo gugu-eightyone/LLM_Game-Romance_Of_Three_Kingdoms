@@ -78,6 +78,8 @@ class ActiveOperation(BaseModel):
     cargo_gold: int = 0
     cargo_food: int = 0
     cargo_prisoners: list[str] = Field(default_factory=list)
+    path: list[str] = Field(default_factory=list)  # ⭐개인 이동 경유 도시열(출발~도착, 출발 시 고정 — 경유지 함락 무관).
+                                                   # 빈 리스트=단일 간선 작전(기존 전부, 구 세이브 호환).
 
 
 class GameState(BaseModel):
@@ -129,6 +131,9 @@ class Battle(BaseModel):
                                                  # 베껴 적는 행위가 보유량에 주의를 강제(과투입 환각 대책) + 불일치=측정 표면.
     troops: int
     generals: list[str] = Field(default_factory=list)
+    hold_at: int = 0                             # ⭐길목 대기(D묶음 2026-09-05): 야전 전용, 출발지에서 N개월 지점 정지
+                                                 # (1~거리−1, 0=끝까지). 지점 도달 시 동결 — 기존 요격 술어가 지나가는 적을
+                                                 # 자동 포착(요격이 "우연"→"의도"). 마일스톤 이름 체계는 안 만듦(환각 표면).
     strategy: str = Field(default="", max_length=STRATEGY_MAX_CHARS)
 
 
@@ -231,13 +236,28 @@ class Transfer(BaseModel):
     prisoners: list[str] = Field(default_factory=list)
     gold: int = 0
     food: int = 0
+    round_trip: bool = False                     # ⭐왕복 호송(D묶음 2026-09-05): 도착·하역 후 **호위 장수만** 복귀
+                                                 # (병력·화물은 내려놓음). 왕복=요격 노출 2배가 자연 비용.
+
+
+class Travel(BaseModel):
+    """⭐개인 이동(D묶음 2026-09-05): 장수 한 명이 아군 영토만 거쳐 최종 목적지까지(호송과 분리된 별도 동사).
+
+    경로=아군 도시만 잇는 최단 경로(엔진 자동), 소요=구간 거리 합. 요격·전투·포획 완전 면제 —
+    경유지 함락=계속 진행, 목적지 함락=무사 회군(리스크 0). 병력·물자는 못 싣는다(그건 호송).
+    """
+    kind: Literal["개인이동"]
+    mode: Literal["개인이동"] = "개인이동"        # 엔진 op.action.mode 분기 공용
+    origin: str
+    target: str                                  # 아군 도시(인접 제한 없음 — 아군 영토 경로가 있으면 어디든)
+    general: str = ""
 
 
 # 개념상 discriminated union(종류별 필드 다름)이나, discriminator를 스키마에 박으면
 # pydantic이 `oneOf`를 내고 → OpenAI 구조화출력이 이를 거부(anyOf만 허용, 스모크로 확인).
 # 세 변형의 `kind` 리터럴이 서로 겹치지 않아 discriminator 없는 평범한 Union으로도
 # 판별이 정확·유일함(잘못된 조합은 그대로 거부). → anyOf로 나가 OpenAI 통과.
-Action = Union[Battle, Scheme, Domestic, Transfer, OpCommand, Diplomacy, Persuade, Dispose]
+Action = Union[Battle, Scheme, Domestic, Transfer, Travel, OpCommand, Diplomacy, Persuade, Dispose]
 ActionAdapter = TypeAdapter(Action)              # dict → 올바른 변형으로 파싱·검증
 
 
