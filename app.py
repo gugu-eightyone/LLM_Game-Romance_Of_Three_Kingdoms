@@ -194,6 +194,7 @@ _CSS = """<style>
 .chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}
 .chip{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:1px 8px;font-size:11px;color:var(--tx)}
 .evcols{display:grid;grid-template-columns:1.2fr 1fr;gap:10px;margin-top:8px}
+.evscroll{max-height:250px;overflow-y:auto;padding-right:4px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
 .panel h3{font-size:13px;color:var(--gold);margin:0 0 7px;font-family:"Noto Serif KR","Batang",serif}
 .ev{padding:3px 0;font-size:13px;display:flex;gap:8px;align-items:baseline;color:var(--tx)}
@@ -328,7 +329,9 @@ def rulebook() -> None:
       + '<div class="chips"><span class="chip">장료 통95</span><span class="chip">장패 통80</span>'
       '<span class="chip" style="opacity:.6">포로 감녕</span></div></div>')
     st.markdown("- **성벽** — 성의 내구도입니다. 공성은 내구도를 깎으며, 내구도가 0인 상태에서 수비마저 "
-                "밀리면 성이 함락됩니다. 파손된 성벽은 성벽보수(내정)로 복구하거나, 공격받지 않는 달에 소량씩 자연 회복됩니다.\n"
+                "밀리면 성이 함락됩니다. **성벽은 공성측이 우세할 때 크게 깎이고, 열세여도 조금씩은 깎입니다** — "
+                "다만 열세인 군대는 성벽을 다 허물어도 성을 빼앗지 못합니다. 병력 소모전은 우세와 무관하게 "
+                "양측 모두에게 매달 발생합니다. 파손된 성벽은 성벽보수(내정)로 복구하거나, 공격받지 않는 달에 소량씩 자연 회복됩니다.\n"
                 "- **군량 월수지** — 병력은 매달 군량을 소비합니다. 수지가 적자인 상태에서 창고가 바닥나면 "
                 "매달 병력이 이탈합니다. 모병으로는 이탈을 막을 수 없으며, 식량증산·호송으로 수지를 회복해야 합니다.\n"
                 "- **장수** — 칩의 숫자는 통솔력입니다. 흐리게 표시된 칩은 이 성에 수감된 포로입니다.\n"
@@ -376,7 +379,12 @@ def rulebook() -> None:
     st.markdown("- **수성은 자동입니다.** 성에 주둔한 병력은 명령 없이도 성벽과 함께 방어합니다. "
                 "단, 성벽은 주둔 병력이 있는 만큼만 방어력을 발휘합니다.\n"
                 "- **출성** — 공격받는 성에서만 가능합니다. 수비대 일부가 성 밖에 포진해 적의 공성 속도를 "
-                "늦추며, 위협이 사라지면 자동으로 성에 복귀합니다. 병력을 과하게 내보내면 성의 방어가 약해집니다.")
+                "늦추며, 위협이 사라지면 자동으로 성에 복귀합니다. 병력을 과하게 내보내면 성의 방어가 약해집니다.\n"
+                "- **포위망 돌파** — 적 공성군이 성벽에 붙어 있는 성에서 부대를 출발시키면(출격·호송) 성문 앞에서 "
+                "그 공성군과 즉시 교전하며, 물리치기 전에는 전진할 수 없습니다. 되돌아오려면 회군 명령을 내리십시오. "
+                "장수 혼자 움직이는 개인 이동만 포위망을 빠져나갈 수 있습니다.\n"
+                "- **보급** — 길 위의 부대는 그 길의 양쪽 끝 성에서만 보급을 받습니다. 양쪽이 모두 적의 손에 "
+                "넘어가면 보급이 끊겨 매달 병력이 굶어 사라지고, 돌아갈 곳도 없어집니다.")
 
     H('<div class="phead">명령 내리기</div>')
     H('<div class="qgrid"><div class="qcard"><div class="chead"><b>출격</b>' + _mpill("전투") + "</div>"
@@ -553,6 +561,8 @@ def _op_kind(o: ActiveOperation) -> str:
 
 
 def _op_name(s: GameState, o: ActiveOperation) -> str:
+    if o.action.mode == "개인이동":                   # ⭐마찰37: 장수 혼자인데 "부대(통84)"는 어색 — 이름만
+        return ",".join(o.committed_generals) or f"{o.faction} 사자"
     if o.committed_generals:
         g = max(o.committed_generals, key=lambda n: s.generals[n].command if n in s.generals else 0)
         cmd = f' <span style="color:var(--mut);font-weight:400;font-size:12px">(통{s.generals[g].command})</span>' \
@@ -574,6 +584,7 @@ def _op_hover(s: GameState, o: ActiveOperation, foes: list[ActiveOperation]) -> 
     rows.append(_srow("병력", f'{o.committed_troops:,} <span class="k">· 사기 {o.unit_morale}</span>'))
     hold = getattr(o.action, "hold_at", 0)
     rows.append(_srow("상태", "교전 중" if o.stage == "교전"
+                      else "조우 — 교전 중" if foes                     # ⭐마찰32: 가분수(1.25/1) 도착 오독 방지
                       else f"{hold}개월 지점 대기 중" if hold and o.progress >= hold
                       else f"이동 {o.progress:g}/{o.threshold:g}개월"))
     for foe in foes:
@@ -620,6 +631,22 @@ def _op_positions(s: GameState) -> dict[int, tuple[float, float]]:
         else:
             f = min(0.94, max(0.06, o.progress / o.threshold if o.threshold else 0))
         pos[o.id] = (x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)
+    # ⭐교전 수렴(마찰32): 길 위 교전 쌍(도착 보류 포함)은 두 말을 교전 지점으로 모은다 —
+    # 진행률 좌표 그대로면 각자 상대 성 앞에 그려져 "상호 공성"처럼 오독되던 것.
+    for a, b in _field_engagements(s):
+        if a.stage == "이동" and b.stage == "이동" and a.id in pos and b.id in pos:
+            (xa, ya), (xb, yb) = pos[a.id], pos[b.id]
+            mx, my = (xa + xb) / 2, (ya + yb) / 2
+            pos[a.id], pos[b.id] = (mx - 0.9, my), (mx + 0.9, my)
+    # ⭐겹침 부채꼴(마찰45): 같은 지점(1% 격자)에 포개진 말은 어긋나게 — 다부대 출격이 하나로 보이던 것.
+    seen: dict[tuple[int, int], int] = {}
+    for oid in sorted(pos):
+        x, y = pos[oid]
+        key = (round(x), round(y))
+        n = seen.get(key, 0)
+        if n:
+            pos[oid] = (x + 1.1 * n, y - 1.3 * n)
+        seen[key] = n + 1
     return pos
 
 
@@ -694,6 +721,44 @@ def _line_faction(s: GameState, line: str) -> str | None:
     return next((c.owner for n, c in s.cities.items() if n in line and c.owner in FACTIONS), None)
 
 
+# ⭐사건 인간화(마찰42, "기계가 보듯 주면 내용 파악이 되노?"): 로그 원문 → 서술형 문장.
+# (패턴, 치환) — 못 알아보는 줄은 [작전N]/[태그] 접두만 떼고 그대로(정보 무손실 폴백).
+_HUMANIZE = [
+    (re.compile(r"^\[작전\d+\] (\S+) (\S+)→(\S+) 진군 개시\(([^)]*)\)"),
+     r"\1군이 \2에서 \3(으)로 진군을 시작했습니다 (\4)"),
+    (re.compile(r"^\[작전\d+\] (\S+) 회군\(교전 이탈, 퇴각 손실\) → (\S+)"),
+     r"\1군이 교전에서 물러나 \2(으)로 회군했습니다 — 퇴각 손실 발생"),
+    (re.compile(r"^\[작전\d+\] (\S+) 회군 명령 → (\S+)"), r"\1군이 \2(으)로 회군했습니다"),
+    (re.compile(r"^\[작전\d+\] (\S+) 부대 (\S+) 도착 → 공성 개시(.*)"), r"\1군이 \2에 당도해 공성을 시작했습니다"),
+    (re.compile(r"^\[작전\d+\] (\S+) (\S+) 공성 중 \(성벽 (\d+)/(\d+).*\)"),
+     r"\1군이 \2 성벽을 두드리고 있습니다 (성벽 \3/\4)"),
+    (re.compile(r"^\[작전\d+\] (\S+) 호송 (\S+) 도착"), r"\1의 호송대가 \2에 도착했습니다"),
+    (re.compile(r"^\[작전\d+\] (\S+) (\S+)–(\S+) 길에서 적과 조우 — 도착 보류\(교전 우선\)"),
+     r"\1군이 \2–\3 길에서 적과 마주쳐 발이 묶였습니다"),
+    (re.compile(r"^\[야전\] 작전\d+\((\S+)\) ↔ 작전\d+\((\S+)\): -(\d+)/-(\d+)"),
+     r"\1군과 \2군이 길 위에서 맞붙었습니다 (손실 \3 · \4)"),
+    (re.compile(r"^\[야전 전멸\] (\S+) 작전\d+ 궤멸"), r"\1군 부대가 야전에서 궤멸했습니다"),
+    (re.compile(r"^\[병량\] (\S+)\((\S+)\) 군량 부족 — 병사 (\d+) 탈영"),
+     r"\2 \1에서 군량이 떨어져 병사 \3명이 흩어졌습니다"),
+    (re.compile(r"^\[병량\] 작전\d+\((\S+)\) 고립 — 보급 두절, 병사 (\d+) 탈영"),
+     r"\1군 부대가 보급이 끊겨 병사 \2명이 흩어졌습니다"),
+    (re.compile(r"^\[지시\] (\S+) 작전\d+ 전략 갱신: (.*)"), r"\1군이 작전 방침을 바꿨습니다 — 「\2」"),
+    (re.compile(r"^\[내정\] (\S+) (\S+) (\S+)\(([^)]*)\)( → .*)?"), r"\1이(가) \2에서 \3을 실시했습니다\5"),
+]
+_PREFIX_RE = re.compile(r"^\[[^\]]+\]\s*")
+
+# 중요도 정렬(마찰42 + Codex U-003 "탈영이 내정에 밀림"): 굵직한 변화 먼저, 나머지는 원 순서 유지.
+_EV_PRIORITY = ("함락", "궤멸", "전멸", "멸망", "처형", "포획", "피랍", "탈영", "퇴각", "항복")
+
+
+def _humanize(line: str) -> str:
+    for pat, repl in _HUMANIZE:
+        m = pat.match(line)
+        if m:
+            return pat.sub(repl, line, count=1)
+    return _PREFIX_RE.sub("", line)                   # 폴백: 태그만 떼고 원문(무손실)
+
+
 def events_panel(s: GameState) -> None:
     evs = []
     # ⭐유효 동맹 = 상단 고정 줄(상태라서 「지속」 배지 + 잔여 개월로 일반 사건과 구분)
@@ -704,22 +769,22 @@ def events_panel(s: GameState) -> None:
         tail = f' <span style="color:var(--mut)">(잔여 {left}개월)</span>' if left else ""
         evs.append(f'<div class="ev">{dots}동맹 유지 중 — {a}·{b}{tail}<span class="oid">지속</span></div>')
     recent = st.session_state.get("events") or s.history[-8:]
-    shown = 0
-    for line in recent:
+    lines = [(0 if l.startswith("[연혁]") else 1 if any(k in l for k in _EV_PRIORITY) else 2, i, l)
+             for i, l in enumerate(recent)
+             if not l.startswith(("[심판]", "[상성]"))]  # 심판 사유=결과 창·작전 카드 몫(여긴 사건 헤드라인만)
+    for _, _, line in sorted(lines):                  # 중요 사건 먼저, 같은 급은 원 순서(stable)
         big = line.startswith("[연혁]")
-        if line.startswith("[심판]") or (not big and shown >= 8):
-            continue                                  # 심판 사유=결과 창·작전 카드 몫(여긴 사건 헤드라인만)
         f = _line_faction(s, line)
         dot = f'<span class="who" style="background:{FCOLOR.get(f, "#4a5261")}"></span>'
         tag = '<span class="evtag">연혁</span>' if big else ""
-        evs.append(f'<div class="ev{" big" if big else ""}">{dot}{_esc(line)}{tag}</div>')
-        shown += 1
+        evs.append(f'<div class="ev{" big" if big else ""}">{dot}{_esc(_humanize(line))}{tag}</div>')
     chron = "".join(
         f'<div class="chron"><b>{_esc(c.split(": ", 1)[0])}</b> {_esc(c.split(": ", 1)[-1])}</div>'
         for c in reversed(s.chronicle[-8:])) or '<div class="chron">(아직 없음)</div>'
     evs_html = "".join(evs) or '<div class="chron">(아직 없음)</div>'
-    H(f'<div class="evcols"><div class="panel"><h3>이번 달 주요 사건</h3>{evs_html}</div>'
-      f'<div class="panel"><h3>주요 연혁</h3>{chron}</div></div>')
+    # ⭐고정 높이+내부 스크롤(마찰42): 사건이 많아도 칸이 화면을 밀어내지 않는다.
+    H(f'<div class="evcols"><div class="panel"><h3>이번 달 주요 사건</h3><div class="evscroll">{evs_html}</div></div>'
+      f'<div class="panel"><h3>주요 연혁</h3><div class="evscroll">{chron}</div></div></div>')
 
 
 # ======================= 진행 중 작전 (⭐마찰 17: 경로 바 / 성벽 HP 바 이원화) =======================
@@ -738,6 +803,7 @@ def _route_bar(s: GameState, o: ActiveOperation, engaged: bool) -> str:
 def _op_card_html(s: GameState, o: ActiveOperation, foes: list[ActiveOperation]) -> str:
     hold = getattr(o.action, "hold_at", 0)
     status = ("교전 중" if o.stage == "교전"
+              else "조우 — 교전 중" if foes                            # ⭐마찰32: 이동 중 조우=도착 아님을 명시
               else f"{hold}개월 지점 대기 중" if hold and o.progress >= hold
               else f"{o.progress:g}/{o.threshold:g}개월")
     head = (f'<div class="chead" style="margin-bottom:4px"><b style="font-size:13.5px">{_op_name(s, o)}</b>'
@@ -796,7 +862,7 @@ def _op_buttons(o: ActiveOperation) -> None:
                  help="철수 명령을 큐에 담습니다(교전 중에는 퇴각 손실). 명령 횟수에 포함되지 않습니다."):
         st.session_state.orders.append(OpCommand(kind="작전지시", op_id=o.id, order="회군"))
         st.rerun()
-    if o.action.mode != "호송":                       # 호송=전략 없음(마찰 20)
+    if o.action.mode not in ("호송", "개인이동"):     # 호송·개인이동=전략 없음(마찰 20·34)
         box = c2.popover("전략변경") if hasattr(st, "popover") else c2.expander("전략변경")
         with box:
             txt = st.text_input("새 전략(50자)", key=f"op_s{o.id}", max_chars=50)
@@ -851,13 +917,18 @@ def state_panel() -> None:
                 f"{n}: " + ("이번 달 고갈 위험" if r == 0 else f"{r}개월 내 고갈") for n, r in alerts))
         threats = [(n, t) for n, c in s.cities.items() if c.owner == player
                    for t in _city_threats(s, n, player)]
-        if threats:
-            st.error("⚠ 피침 — " + ", ".join(
-                f"{n}: {t.faction}군 {t.committed_troops:,}"
-                + (" 성 앞 교전 중" if t.stage == "교전" else " 접근 중") for n, t in threats))
+        if threats:                                   # ⭐마찰33: 나열체 → 파발 급보체(방면·당도 예상 포함)
+            lines = []
+            for n, t in threats:
+                if t.stage == "교전":
+                    lines.append(f"{t.faction}군 {t.committed_troops:,}이(가) {n} 성벽에 붙어 공성 중입니다")
+                else:
+                    eta = max(1, round(t.threshold - t.progress))
+                    lines.append(f"{t.faction}군 {t.committed_troops:,}이(가) {t.action.origin} 방면에서 "
+                                 f"{n}(으)로 진군 중입니다 — 약 {eta}개월 뒤 당도할 것으로 보입니다")
+            st.error("🚨 급보 — " + " / ".join(lines))
     map_panel(s)                                      # ⭐마찰 4: 지도가 핵심 화면(expander 해제)
-    events_panel(s)
-    ops_panel(s)
+    events_panel(s)                                   # 진행 중 작전은 명령 칸 아래로(⭐마찰41 위치 교체)
 
 
 # ======================= 도시 표·브리핑 (명령 칸 아래, ⭐마찰 4 배치) =======================
@@ -1029,7 +1100,7 @@ def order_builder() -> None:
                         kind="전투", mode="야전" if mode == "출성" else mode, origin=origin,
                         target=target, troops=int(troops), hold_at=int(hold),
                         generals=[] if gen == "(없음)" else [gen], strategy=strat))
-                    _clear_inputs("b_n", "b_g", "b_s", "b_h")
+                    _clear_inputs("b_o", "b_m", "b_t", "b_n", "b_g", "b_s", "b_h")   # ⭐마찰10 잔차: 셀렉트도 초기화
                     st.rerun()
 
         elif tab == "내정":
@@ -1053,7 +1124,7 @@ def order_builder() -> None:
                 st.session_state.orders.append(Domestic(
                     kind="내정", city=city_n, item=item, gold_spent=int(gold),
                     general="" if overseer == "(없음)" else overseer, strategy=strat))
-                _clear_inputs("d_g", "d_gen", "d_s", "d_s2")
+                _clear_inputs("d_c", "d_i", "d_g", "d_gen", "d_s", "d_s2")
                 st.rerun()
 
         elif tab == "호송":                               # 호송: 인접 아군 도시만(위젯이 걸러줌)
@@ -1079,7 +1150,7 @@ def order_builder() -> None:
                         if st.button("명령 추가", key="v_add", disabled=left <= 0):
                             st.session_state.orders.append(Travel(
                                 kind="개인이동", origin=origin, target=target, general=gen))
-                            _clear_inputs("v_g")
+                            _clear_inputs("v_o", "v_t", "v_g")
                             st.rerun()
             elif not pairs:
                 st.caption("호송 가능한 인접 아군 성이 없습니다.")
@@ -1106,7 +1177,7 @@ def order_builder() -> None:
                         kind="호송", origin=origin, target=target, troops=int(troops),
                         generals=gens, prisoners=pris, gold=int(gold), food=int(food),
                         round_trip=bool(rt and gens)))
-                    _clear_inputs("t_n", "t_g", "t_p", "t_gold", "t_f", "t_rt")
+                    _clear_inputs("t_o", "t_t", "t_n", "t_g", "t_p", "t_gold", "t_f", "t_rt")
                     st.rerun()
 
         elif tab == "작전지시":
@@ -1114,12 +1185,14 @@ def order_builder() -> None:
             if not ops:
                 st.caption("진행 중인 아군 작전이 없습니다.")
             else:
-                label = {o.id: f"[{o.id}] {o.action.origin}→{o.action.target} {o.action.mode} ({o.stage})"
+                # ⭐마찰46: 번호 대신 부대명(카드와 같은 이름 — 개인 이동=장수명), 번호는 보조
+                label = {o.id: f"{_op_name(s, o).split(' <')[0]} — {o.action.origin}→{o.action.target}"
+                               f" {o.action.mode} ({o.stage}) · 작전{o.id}"
                          for o in ops}
                 op_id = st.selectbox("작전", list(label), format_func=label.get, key="o_id")
                 sel = next(o for o in ops if o.id == op_id)
                 # ⭐호송은 전략이 없음(마찰 20): 적게 해놓고 기각하는 함정 제거 — 회군만 노출
-                choices = ["회군"] if sel.action.mode == "호송" else ["전략변경", "회군"]
+                choices = ["회군"] if sel.action.mode in ("호송", "개인이동") else ["전략변경", "회군"]
                 order = st.radio("지시", choices, horizontal=True, key="o_ord",
                                  help="회군은 명령 횟수에 포함되지 않습니다(교전 중에는 퇴각 손실이 발생합니다). "
                                       "전략변경은 명령 1건을 사용하며 다시 채점됩니다.")
@@ -1127,7 +1200,7 @@ def order_builder() -> None:
                 if st.button("명령 추가", key="o_add", disabled=left <= 0 and order != "회군"):
                     st.session_state.orders.append(OpCommand(
                         kind="작전지시", op_id=op_id, order=order, strategy=strat))
-                    _clear_inputs("o_s")
+                    _clear_inputs("o_id", "o_ord", "o_s")
                     st.rerun()
 
         elif tab == "외교":                               # 외교: 성립 가능한 제안만 노출(파기=동맹 중일 때만, ⭐§9-22)
@@ -1177,7 +1250,7 @@ def order_builder() -> None:
                         proposal="동맹" if prop == "연장" else prop,   # 연장=동맹 재제안(엔진 규약)
                         months=int(months), prisoner=prisoner,
                         offer_gold=int(og), offer_food=int(of), pay_city=pay_city, envoy=envoy, message=msg))
-                    _clear_inputs("dp_m", "dp_g", "dp_f")
+                    _clear_inputs("dp_t", "dp_p", "dp_mo", "dp_pr", "dp_pc", "dp_e", "dp_m", "dp_g", "dp_f")
                     st.rerun()
 
     # ⭐명령 큐 = 카드(목업 qcard 문법, 마찰 11) + 취소 버튼
@@ -1329,11 +1402,16 @@ def results_screen() -> None:
     st.subheader(f"{s.year}년 {s.month}월 — 지난 달 결과")
     if st.session_state.narrate and st.session_state.events:
         if st.session_state.narration is None:
+            # ⭐메타 누수 차단(마찰50, "심판의 뜻이 박하여"): 시스템 장치 로그는 서사꾼에게 안 준다 —
+            # 세계관에 실재하는 사건([작전]·[병량]·[연혁]·함락 등)만 극화 대상.
+            meta = ("[심판]", "[상성]", "[검산", "[위반]", "[환각]", "[기각]")
+            tale_events = [e for e in st.session_state.events
+                           if not e.lstrip().startswith(meta)]
             with st.spinner("사관이 붓을 들었습니다..."):
                 try:
                     st.session_state.narration = structured_complete(
                         Narration, load_prompt("narration"),
-                        "\n".join(st.session_state.events)).text
+                        "\n".join(tale_events)).text
                 except LLMError:
                     st.session_state.narration = "(이 달의 기록은 소실되었다)"
         st.markdown(f"> {st.session_state.narration}")
@@ -1481,6 +1559,7 @@ else:                                                 # play
         order_builder()
     else:
         st.caption("관전 모드 — 매달 세 세력의 AI가 자율적으로 결정합니다.")
+    ops_panel(S())                                    # ⭐마찰41: 명령 칸 아래로(작전 목록이 길어도 명령이 위)
     tables_panel()
     if not st.session_state.over:
         endturn_bar()

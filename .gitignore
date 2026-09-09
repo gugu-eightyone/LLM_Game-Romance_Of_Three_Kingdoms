@@ -15,6 +15,7 @@ __pycache__/
 .omc
 docs
 CLAUDE.md
+AGENTS.md
 # 부가 툴링(지도 렌더·탐침 등) — 게임 본체 아님, 로컬 전용
 tools/
 # 세이브 파일(로컬 전용)

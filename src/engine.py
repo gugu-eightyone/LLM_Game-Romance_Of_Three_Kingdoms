@@ -31,7 +31,7 @@ from .config import (
     MORALE_FEAST_CAP, MORALE_RULER_CAPTURED,
     PERSUADE_BASE, PERSUADE_INTEL_SCALE, PREP_CAP, PREP_RATE,
     SURRENDER_CITY_GATE, SURRENDER_CITY_WEIGHT,
-    RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE, SIEGE_RATE,
+    RIVER_CROSS_PENALTY, ROUT_MORALE_THRESHOLD, SIEGE_BASE, SIEGE_CHIP_MAX, SIEGE_RATE,
     SIEGE_RETREAT_SURVIVAL, SORTIE_SLOW_CAP, UNIT_MORALE_COMBAT_DROP,
     WALL_CAPTURE_HEAL_RATIO, WALL_DEFENSE, WALL_HP_SCALE, WALL_MANNING,
     WALL_REGEN_PER_TURN, WALL_REPAIR_GOLD_PER_HP,
@@ -198,8 +198,9 @@ def _judge_strategy(state: GameState, op: ActiveOperation, judge: JudgeFn | None
         return
     score, reason = verdict
     op.strategy_mod = _judge_mod(score, STRATEGY_MODIFIER_BOUND)
-    state.history.append(
-        f"[심판] 작전{op.id} 전략 「{text}」 {score}/10 ({reason}) → 전투 보정 {op.strategy_mod:+.0%}")
+    state.history.append(                             # ⭐세력 명시(마찰36): 결과 창 그룹핑이 도시명 추정으로
+        f"[심판] {op.faction} 작전{op.id} 전략 「{text}」 {score}/10 "   # 오배치되던 것 — 로그 발생지에서 박는다
+        f"({reason}) → 전투 보정 {op.strategy_mod:+.0%}")
 
 
 def start_operation(state: GameState, action: Battle, actor: str | None = None,
@@ -350,15 +351,17 @@ def apply_domestic(state: GameState, action: Domestic, actor: str | None = None,
             if verdict is not None:
                 score, reason = verdict
                 mod = _judge_mod(score, DOMESTIC_MODIFIER_BOUND)
-                state.history.append(
-                    f"[심판] {action.city} 모병 방침 「{action.strategy}」 {score}/10 ({reason}) → 효율 {mod:+.0%}")
+                state.history.append(                 # ⭐세력 명시(마찰36)
+                    f"[심판] {city.owner} {action.city} 모병 방침 「{action.strategy}」 {score}/10 ({reason}) → 효율 {mod:+.0%}")
         gained = round(base * mult * (1 + mod))
         city.troops += gained
         note = f" → 병력 +{gained}"
     elif action.item == "사기진작":
         f = state.factions.get(city.owner)
         if f and f.morale < MORALE_FEAST_CAP:  # 만찬 천장(⭐금 도배 방지): 그 위 사기는 승리(함락)로만
+            before = f.morale
             f.morale = min(MORALE_FEAST_CAP, f.morale + spend // 500)
+            note = f" → 사기 +{f.morale - before} ({before}→{f.morale})"   # ⭐마찰44: 델타 표시(모병·증산과 동형)
         elif f:
             state.history.append(f"[내정] {city.owner} 사기진작 무효 — 잔치로는 사기 {MORALE_FEAST_CAP} 이상 못 올림(금만 소모)")
     state.history.append(f"[내정] {city.owner} {action.city} {action.item}(금 {spend}"
@@ -526,7 +529,7 @@ def apply_op_command(state: GameState, action: OpCommand, actor: str | None = No
             state.history.append(f"[기각] 작전{op.id}({op.action.mode})은 전략을 갖지 않음")
             return
         op.action.strategy = action.strategy
-        state.history.append(f"[지시] 작전{op.id} 전략 갱신: {action.strategy}")
+        state.history.append(f"[지시] {op.faction} 작전{op.id} 전략 갱신: {action.strategy}")   # ⭐세력 명시(마찰36)
         _judge_strategy(state, op, judge)             # ⭐새 전략 재채점 → 보정 갱신
 
 
@@ -690,7 +693,10 @@ def _siege_round(state: GameState, op: ActiveOperation) -> None:
                         and o.action.mode == "야전" and o.action.origin == o.action.target == op.action.target)
     # 감속 = (출성비)² 볼록 곡선(⭐2026-09-05): 찔끔 출성의 저투입 효율 차단 — 포획확률 포위도²와 같은 문법.
     slow = min(SORTIE_SLOW_CAP, (sortie_troops / op.committed_troops) ** 2) if sortie_troops and op.committed_troops > 0 else 0.0
-    dmg = max(0, round(dominance * SIEGE_RATE * WALL_HP_SCALE * (1 - slow)))
+    # ⭐치핑(마찰25, 2026-09-09 채택): 열세여도 전력비만큼 최소 피해 — "성벽 타격 0은 말이 안돼".
+    # 함락 가드(아래 dominance>0)는 그대로 = 약체가 성을 따진 못하고 성벽만 정직하게 갉는다.
+    base = max(dominance * SIEGE_RATE * WALL_HP_SCALE, min(1.0, dominance + 1.0) * SIEGE_CHIP_MAX)
+    dmg = max(0, round(base * (1 - slow)))
     city.wall_hp = max(0, _wall_hp(city) - dmg)
     slow_note = f", 출성 견제 −{slow:.0%}" if slow else ""
     state.history.append(                             # 라운드 가시화(F층 관측성·관전): 무음 공성 해소
@@ -814,6 +820,9 @@ def _field_engagements(state: GameState) -> list[tuple[ActiveOperation, ActiveOp
 
     ① 같은 간선 반대방향 이동 + progress합 ≥ 거리 → 도로에서 교차(마일스톤 지점).
     ② 같은 도시서 둘 다 교전(공성 op ↔ 그 도시 도착한 구원 op).
+    ③ ⭐포위 ZOC(마찰40, 2026-09-10 확정): 교전 중인 공성군이 있는 성에서 출발한 부대(전투·호송,
+       progress<1=아직 성문 앞)는 공성군과 교전 성립 — 해소(상대 소멸·퇴각·회군) 전엔 전진 불가
+       (engaged=이동 동결, 기존 메커니즘 재사용). "1회 교전 후 통과"안은 폐기(⭐사용자 "부딪히면 못 가게").
     """
     ops = [o for o in state.operations if o.action.mode != "개인이동"]   # ⭐개인 이동=요격·전투 완전 면제
     pairs = []
@@ -829,6 +838,13 @@ def _field_engagements(state: GameState) -> list[tuple[ActiveOperation, ActiveOp
                     continue
             if a.stage == "교전" and b.stage == "교전" and a.action.target == b.action.target:
                 pairs.append((a, b))
+                continue
+            for mv, sg in ((a, b), (b, a)):           # ③ 포위 돌파: 출발 부대 ↔ 성문 앞 공성군
+                if (mv.stage == "이동" and mv.progress < 1
+                        and sg.stage == "교전" and sg.action.mode == "공성"
+                        and sg.action.target == mv.action.origin):
+                    pairs.append((mv, sg))
+                    break
     return pairs
 
 
@@ -947,15 +963,17 @@ def _resolve_op_end(state: GameState, op: ActiveOperation, n_field: int,
 
 # ---- 작전 해소 처분(복귀/격퇴/퇴각/야전포로) ----
 def _home_city(state: GameState, op: ActiveOperation) -> str | None:
-    """복귀·퇴각 목적지: 출발도시(아군이면) → 현 위치 인접 아군 도시 → 없으면 None(고립)."""
-    o = state.cities.get(op.action.origin)
-    if o and o.owner == op.faction:
-        return op.action.origin
-    for node in (op.action.target, op.action.origin):
-        for nb in state.distances.get(node, {}):
-            c = state.cities.get(nb)
-            if c and c.owner == op.faction:
-                return nb
+    """복귀·퇴각·보급처: 간선 양단(출발지→목적지) 중 아군 노드만 — 없으면 None(고립).
+
+    ⭐도달 가능성 규칙(마찰49, 2026-09-10): 길 위 부대가 적 도시를 밟지 않고 갈 수 있는 곳은
+    자기 간선의 양 끝뿐. 구 "인접 아군" 그래프 폴백은 적 성 관통 원격 보급·텔레포트 복귀를
+    허용했음(장안-한중 사이 위군이 낙양에서 밥 받던 사례) → 폐기. 양단 다 적 = 진짜 고립
+    (보급 두절=매턴 굶주림 탈영, 복귀 불가=구사일생/포로) — 협곡에 갇힌 부대는 말라죽는다.
+    """
+    for node in (op.action.origin, op.action.target):
+        c = state.cities.get(node)
+        if c and c.owner == op.faction:
+            return node
     return None
 
 
