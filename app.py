@@ -21,8 +21,8 @@ import pandas as pd
 import streamlit as st
 from pydantic import BaseModel, Field
 
-from src.config import (CITY_INCOME_GOLD, FOOD_ALERT_MONTHS, MAX_ORDERS_PER_TURN,
-                        MORALE_FEAST_CAP, PARLEY_MAX_ROUNDS)
+from src.config import (ALLIANCE_DEFAULT_MONTHS, CITY_INCOME_GOLD, FOOD_ALERT_MONTHS,
+                        MAX_ORDERS_PER_TURN, MORALE_FEAST_CAP, PARLEY_MAX_ROUNDS)
 from src.decide import (brief, decide, matchup_judge, resolve_dispositions,
                         resolve_proposals, turn_judge)
 from src.engine import (_city_threats, _field_engagements, _wall_hp, _wall_max,
@@ -120,6 +120,9 @@ def end_turn(slot=None) -> None:
         if a:
             actions[name] = a
     show(len(ai))
+    report_ym = (s.year, s.month)                     # ⭐U-010: 결과 창 제목=판정 대상 월(진행 후 월이 넘어감)
+    pre = {"city": {n: (c.troops, _wall_hp(c)) for n, c in s.cities.items()},   # ⭐U-008: 전력 변화 표의
+           "ops": {o.id: o.committed_troops for o in s.operations}}             #   월초 기준값 스냅샷
     # ⭐계획 단위 일괄 채점 + 교전 상성(2026-09-05) — 플레이어 전략도 같은 심판(가시화)
     advance_turn(s, actions, judge=turn_judge(s, actions), matchup=matchup_judge)
     show(len(ai) + 1)
@@ -131,7 +134,8 @@ def end_turn(slot=None) -> None:
                sum(c.food for c in s.cities.values() if c.owner == player) - f0,
                time.monotonic() - t0)
     st.session_state.update(events=s.history[h0:], orders=[], parley_used=0,
-                            retorts=[], narration=None, mode="results", eco=eco)
+                            retorts=[], narration=None, mode="results", eco=eco,
+                            report_ym=report_ym, pre_turn=pre, decided=[])   # decided=U-002 처리 완료 피드백
     # 플레이어 패배 판정(엔진 승리조건 위에 플레이어 모드 전용 층, §9-10)
     if player:
         if s.winner:
@@ -259,6 +263,22 @@ h1,h2,h3{font-family:"Noto Serif KR","Batang",serif !important}
 .hero{text-align:center;padding:40px 0 24px}
 .hero .hbrand{font-family:"Noto Serif KR","Batang",serif;font-size:64px;line-height:1.1;color:var(--gold);letter-spacing:16px;text-indent:16px;text-shadow:0 2px 28px rgba(212,169,78,.30)}
 .hero .hsub{font-family:"Noto Serif KR","Batang",serif;font-size:20px;font-weight:700;margin-top:12px;color:var(--tx)}
+/* ── 결과 창 v3 (마찰39 + U-001·002·005·007~010) ── */
+.rhead{display:flex;align-items:center;gap:12px;margin:4px 0 8px;flex-wrap:wrap}
+.rtitle{font-family:"Noto Serif KR","Batang",serif;font-size:21px;font-weight:700;color:var(--gold)}
+.todo{font-size:12.5px;font-weight:700;color:#1a1408;background:linear-gradient(180deg,#e0ba66,var(--gold));border-radius:14px;padding:2px 12px}
+.mine{border:1px solid rgba(56,158,86,.45);border-radius:12px;padding:2px 12px 12px;background:rgba(56,158,86,.05);margin-top:10px}
+.dtab{border-collapse:collapse;margin-top:8px;font-size:12.5px;width:100%}
+.dtab th,.dtab td{border:1px solid var(--line);padding:3px 9px;text-align:right;color:var(--tx)}
+.dtab th{background:var(--panel2);color:var(--mut);font-weight:400;font-size:11.5px}
+.dtab td:first-child,.dtab th:first-child{text-align:left}
+.nextrow{display:inline-flex;gap:6px;margin-top:7px;background:rgba(212,169,78,.10);border:1px solid rgba(212,169,78,.4);border-radius:7px;padding:3px 9px;font-size:12.5px;color:#ffd98a}
+.fbline{border-radius:9px;padding:8px 12px;margin-top:6px;font-size:13px}
+.fbline.ok{background:rgba(56,158,86,.12);border:1px solid rgba(56,158,86,.5);color:#a9e0b8}
+.fbline.bad{background:rgba(199,84,80,.10);border:1px solid rgba(199,84,80,.5);color:#eba9a6}
+.terms{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0;font-size:12.5px}
+.term{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 10px;color:var(--tx)}
+.term b{color:var(--gold)}
 </style>"""
 
 
@@ -932,10 +952,11 @@ def tables_panel() -> None:
         } for c in ordered])
         st.dataframe(df.style.apply(lambda r: [_BG.get(r["소유"], "")] * len(r), axis=1),
                      height=300, hide_index=True)
-    with st.expander("전체 로그(원문)"):
+    with st.expander("🛠 개발 정보 (로그·LLM 입력)"):   # ⭐U-005: 개발·평가용 정보는 한 곳으로 격리
+        st.caption("전체 로그(원문)")
         st.text("\n".join(s.history[-40:]) or "(아직 없음)")
-    if player:
-        with st.expander("정세 브리핑(LLM이 보는 그대로)"):
+        if player:
+            st.caption("정세 브리핑(LLM이 보는 그대로)")
             st.text(brief(s, player))
 
 
@@ -1373,27 +1394,179 @@ def _result_groups(s: GameState, events: list[str]):
     return banners, op_cards, loose, misc
 
 
+def _judge_bits(lines: list[str]) -> tuple[str, str]:
+    """카드 내 심판 표기(⭐U-009): 최신 판정만, 적용 대상(전투력/모병 효율) 명시. (chip, 사유 html)."""
+    judge = next((l for l in reversed(lines) if l.startswith("[심판]")), None)   # 재채점 시 최신만(이전=원문 로그)
+    if not judge:
+        return "", ""
+    m = _JUDGE_RE.search(judge)
+    if not m:
+        return "", f'<div class="jwhy">{_esc(judge)}</div>'
+    unit = "모병 효율" if "효율" in judge else "전투력"
+    cls = " zero" if m.group(2).lstrip("+-−±") == "0" else \
+        " neg" if m.group(2)[0] in "-−" else ""
+    return (f'<span class="jchip{cls}">심판 {m.group(1)}/10 · {unit} {m.group(2)}% 반영</span>',
+            f'<div class="jwhy">{_esc(judge)}</div>')
+
+
 def _render_rescard(lines: list[str], color: str) -> str:
-    judge = next((l for l in lines if l.startswith("[심판]")), None)
-    chip = ""
-    if judge:
-        m = _JUDGE_RE.search(judge)
-        if m:
-            cls = " zero" if m.group(2).lstrip("+-−±") == "0" else \
-                " neg" if m.group(2)[0] in "-−" else ""
-            chip = f'<span class="jchip{cls}">심판 {m.group(1)}/10 → {m.group(2)}%</span>'
-    head_line = next((l for l in lines if not l.startswith("[심판]")), lines[0])
-    rest = [l for l in lines if l is not head_line and not l.startswith("[심판]")]
-    body = "".join(f'<div class="rline">{_esc(l)}</div>' for l in rest)
-    jwhy = f'<div class="jwhy">{_esc(judge)}</div>' if judge else ""
+    chip, jwhy = _judge_bits(lines)
+    plain = [l for l in lines if not l.startswith("[심판]")]
+    head_line = plain[0] if plain else lines[0]
+    body = "".join(f'<div class="rline">{_esc(_humanize(l))}</div>' for l in plain[1:])
     return (f'<div class="rescard" style="border-left-color:{color}">'
-            f'<div class="chead"><b style="font-size:13.5px">{_esc(head_line)}</b>{chip}</div>'
+            f'<div class="chead"><b style="font-size:13.5px">{_esc(_humanize(head_line))}</b>{chip}</div>'
             f"{body}{jwhy}</div>")
+
+
+_CAPTURE_RE = re.compile(r"\[작전(\d+)\] (\S+), (\S+) 함락 \(구 (\S+)\)")
+_RETREAT_RE = re.compile(r"수비 잔병 ([\d,]+)")
+
+
+def _capture_card(s: GameState, lines: list[str], color: str, pre: dict | None) -> str:
+    """함락 카드(⭐U-008): 월초 스냅샷+로그로 전력 변화 표 — "진격 가능"의 근거(내 손실·생존)를 보인다.
+
+    ponytail: '전투 직후' 열은 엔진이 함락 순간 수치를 구조화 기록해야 정확 — 월초|현재|변화로 축약
+    (엔진 턴 리포트 도입 시 3시점으로 승격). 스냅샷 없으면(구 세이브 로드 직후) 일반 카드로 폴백.
+    """
+    m = next((mm for l in lines if (mm := _CAPTURE_RE.search(l))), None)
+    c = s.cities.get(m.group(3)) if m else None
+    if m is None or c is None or pre is None:
+        return _render_rescard(lines, color)
+    opid, winner, city = int(m.group(1)), m.group(2), m.group(3)
+    atk0 = pre.get("ops", {}).get(opid)
+    def0, wall0 = pre.get("city", {}).get(city, (None, None))
+    retreat = next((int(mm.group(1).replace(",", "")) for l in lines
+                    if (mm := _RETREAT_RE.search(l))), 0)
+    rows = [("아군 공성군", f"{atk0:,}" if atk0 else "—", f"{c.troops:,} 주둔",
+             f"전사 −{max(0, atk0 - c.troops):,}" if atk0 else "")]
+    if def0 is not None:
+        rows.append(("적 수비군", f"{def0:,}", "0",
+                     f"전사 −{max(0, def0 - retreat):,}"
+                     + (f" · 잔병 {retreat:,} 퇴각" if retreat else "")))
+        rows.append(("성벽", f"{wall0:,}", f"{_wall_hp(c):,}/{_wall_max(c):,}",
+                     "점령 응급 보수 반영" if _wall_hp(c) > 0 else ""))
+    table = ('<table class="dtab"><tr><th>항목</th><th>월초</th><th>현재</th><th>변화</th></tr>'
+             + "".join(f"<tr><td>{a}</td><td>{b}</td><td>{cc}</td><td>{d}</td></tr>"
+                       for a, b, cc, d in rows) + "</table>")
+    extras = [l for l in lines if not l.startswith("[심판]") and not _CAPTURE_RE.search(l)
+              and not _RETREAT_RE.search(l)]
+    body = "".join(f'<div class="rline">{_esc(_humanize(l))}</div>' for l in extras)
+    adj = [f"{n}({d}개월)" for n, d in s.distances.get(city, {}).items()
+           if (cc := s.cities.get(n)) and cc.owner not in (winner, "중립")
+           and not allied(s, winner, cc.owner)]
+    hint = (f'<div class="nextrow">→ {s.month}월 명령에서 가능: {city}에서 출격'
+            + (f" · 공성 후보 {', '.join(adj[:3])}" if adj else "") + "</div>")
+    chip, jwhy = _judge_bits(lines)
+    return (f'<div class="rescard" style="border-left-color:{color}">'
+            f'<div class="chead"><b style="font-size:13.5px">{city} 점령 — 생존 병력 {c.troops:,} 주둔</b>{chip}</div>'
+            f"{table}{body}{hint}{jwhy}</div>")
+
+
+def _decision_area(s: GameState, player: str) -> None:
+    """⭐결정 영역(U-007: 내 세력 직후 배치·강제 결정 / U-001 기간 표시 / U-002 즉시 피드백).
+
+    응답한 카드는 사라지는 대신 `decided` 피드백(성사/무산·적용 조건)으로 남는다 — 접기에 묶음.
+    """
+    my_captives = [(c, p) for c, p in s.pending_captives
+                   if s.cities.get(c) and s.cities[c].owner == player]
+    my_props = [p for p in s.proposals if p.to_faction == player]
+    decided = st.session_state.get("decided") or []
+    if not (my_captives or my_props or decided):
+        return
+    H('<div class="phead">결정 필요 — 외교·포로</div>')
+    n = 0
+    for i, prop in enumerate(my_props):
+        n += 1
+        detail = {"동맹": "동맹 제안", "항복권유": "항복 권유 — 수락하면 나라를 넘기고 패배합니다",
+                  "포로반환": f"포로 {prop.prisoner} 반환 요청(몸값 금{prop.offer_gold:,}·식{prop.offer_food:,})"
+                  }[prop.proposal]
+        with st.container(border=True):
+            st.markdown(f"**결정 {n}** — " + _pill(prop.from_faction, small=True)
+                        + f" **{prop.from_faction}의 {detail}**"
+                        + (f" · 사신 {prop.envoy}" if prop.envoy else ""), unsafe_allow_html=True)
+            if prop.proposal == "동맹":               # ⭐U-001: 계약 조건을 구조화 표기(국서에 안 맡김)
+                months = prop.months if prop.months > 0 else ALLIANCE_DEFAULT_MONTHS
+                left_m = s.alliance_expires.get("|".join(sorted((player, prop.from_faction))))
+                extend = allied(s, player, prop.from_faction)
+                H('<div class="terms"><span class="term">기간 <b>' + f"{months}개월</b></span>"
+                  + (f'<span class="term">현재 동맹 {"잔여 " + str(left_m) + "개월" if left_m else "무기한"}'
+                     f' → 수락 시 <b>{months}개월로 재설정</b></span>' if extend else "")
+                  + '<span class="term">효과: 상호 불가침 · 구원 출격 가능</span></div>')
+            if prop.message:
+                st.markdown(f"> {prop.message}")
+            say = st.text_input("답신 한마디(선택 — 상대가 읽고 응수합니다)", max_chars=50,
+                                key=f"say_{prop.from_faction}_{prop.proposal}_{prop.prisoner}")
+            c1, c2 = st.columns(2)
+            for col, accept in ((c1, True), (c2, False)):
+                if col.button("수락" if accept else "거절", key=f"resp{i}_{accept}",
+                              use_container_width=True):
+                    ok = respond_proposal(s, prop, accept, say)
+                    if say:                           # 옵트인 응수: 판정 이후, 결과 영향 0
+                        ruler = s.factions[prop.from_faction].ruler
+                        fb = ParleyReply(text="…… (사신이 말없이 물러간다)")
+                        r = structured_complete(ParleyReply, load_prompt("ruler_retort").format(
+                            ruler=ruler, faction=prop.from_faction, target=player,
+                            proposal=prop.proposal, verdict="수락" if accept else "거절"),
+                            f"{player} 군주의 답신: {say}", fallback=fb)
+                        st.session_state.retorts.append(f"**{ruler}**: {r.text}")
+                    if accept and prop.proposal == "항복권유":
+                        st.session_state.over = f"패배 — {prop.from_faction}에 항복"
+                    st.session_state.decided.append(_prop_feedback(s, prop, accept, ok))  # ⭐U-002
+                    st.rerun()
+    for city_n, p in my_captives:
+        n += 1
+        g = s.generals.get(p)
+        ruler = bool(g and g.is_ruler and s.factions.get(g.faction) and s.factions[g.faction].alive)
+        with st.container(border=True):
+            st.markdown(f"**결정 {n}** — 포로 처분: **{p}** ({city_n} 포획, 원 소속 {g.faction if g else '미상'}"
+                        + (f" · 통솔 {g.command}" if g else "")
+                        + (" · **군주! 석방/처형만**" if ruler else "") + ")")
+            st.caption(f"설득은 {s.month}월 명령에서 담화로 가능합니다.")
+            cols = st.columns(2 if ruler else 3)
+            choices = ["석방", "처형"] if ruler else ["석방", "계속 수감", "처형"]   # ⭐"계속 수감"=현상 유지 명시
+            for col, label in zip(cols, choices):
+                if col.button(label, key=f"disp_{city_n}_{p}_{label}", use_container_width=True):
+                    choice = "수감" if label == "계속 수감" else label
+                    apply_disposition(s, city_n, p, choice)
+                    s.pending_captives.remove((city_n, p))
+                    st.session_state.decided.append(
+                        f'<div class="fbline ok">{_esc(p)} — {label} 처리'
+                        + (" · 원 세력으로 송환(연혁에 은혜로 기록)" if choice == "석방"
+                           else " · 연혁에 기록" if choice == "처형" else f" · {city_n} 감옥 유지") + "</div>")
+                    st.rerun()
+    if decided:
+        with st.expander(f"이번 전황 보고에서 처리 완료 {len(decided)}건"):
+            for html in decided:
+                H(html)
+
+
+def _prop_feedback(s: GameState, prop, accept: bool, ok: bool) -> str:
+    """⭐U-002: 응답 직후 결정론 처리 결과를 명시(성사=적용 조건 / 무산=사유)."""
+    who = prop.from_faction
+    if not accept:
+        return f'<div class="fbline bad">거절 — {who}의 {prop.proposal}</div>'
+    if prop.proposal == "동맹":
+        months = prop.months if prop.months > 0 else ALLIANCE_DEFAULT_MONTHS
+        return (f'<div class="fbline ok">✅ 수락 — {who}와 동맹 체결({months}개월) · 연혁에 기록</div>' if ok
+                else f'<div class="fbline bad">⚠ 수락했으나 무산 — {who} 세력 소멸</div>')
+    if prop.proposal == "포로반환":
+        return (f'<div class="fbline ok">✅ 수락 — 몸값 금{prop.offer_gold:,}·식{prop.offer_food:,} 수취, '
+                f"{prop.prisoner} 송환 · 연혁에 기록</div>" if ok else
+                f'<div class="fbline bad">⚠ 수락했으나 무산 — 포로 부재 또는 {who}의 몸값 지불 여력 소진. '
+                f"{prop.prisoner}는 수감 유지</div>")
+    return f'<div class="fbline ok">수락 — {who}의 {prop.proposal}</div>'
 
 
 def results_screen() -> None:
     s, player = S(), st.session_state.player
-    st.subheader(f"{s.year}년 {s.month}월 — 지난 달 결과")
+    ry, rm = st.session_state.get("report_ym") or \
+        ((s.year, s.month - 1) if s.month > 1 else (s.year - 1, 12))
+    ndec = (len([1 for c, p in s.pending_captives
+                 if s.cities.get(c) and s.cities[c].owner == player])
+            + len([1 for p in s.proposals if p.to_faction == player])) if player else 0
+    H(f'<div class="rhead"><span class="rtitle">{ry}년 {rm}월 전황 보고</span>'   # ⭐U-010: 보고 월까지만
+      + (f'<span class="todo">결정 필요 {ndec}건 ↓</span>' if ndec else "") + "</div>")
     if st.session_state.narrate and st.session_state.events:
         if st.session_state.narration is None:
             # ⭐메타 누수 차단(마찰50, "심판의 뜻이 박하여"): 시스템 장치 로그는 서사꾼에게 안 준다 —
@@ -1411,23 +1584,35 @@ def results_screen() -> None:
         st.markdown(f"> {st.session_state.narration}")
 
     banners, op_cards, loose, misc = _result_groups(s, st.session_state.events)
-    for b in banners:                                 # ⭐대사건=배너(연혁급 강조)
+    for b in banners:                                 # ⭐대사건=배너(연혁급 강조, 위계 1티어)
         H(f'<div class="banner">{_esc(b)}</div>')
-    order = ([player] if player else []) + [f for f in FACTIONS if f != player]
-    for f in order:
+    pre = st.session_state.get("pre_turn")
+
+    def _faction_html(f: str) -> str:
         cards = [c for c in op_cards.values() if c["faction"] == f]
         lines = loose.get(f, [])
         if not cards and not lines:
-            continue
+            return ""
         tag = " (나)" if f == player else ""
-        H(f'<div class="fsec"><div class="chead">{_pill(f, f + tag)}</div></div>')
-        for c in cards:
-            H(_render_rescard(c["lines"], FCOLOR.get(f, "#666")))
-        if lines:
-            H(_render_rescard(lines, FCOLOR.get(f, "#666")) if len(lines) == 1 else
-              '<div class="rescard" style="border-left-color:%s">%s</div>'
-              % (FCOLOR.get(f, "#666"),
-                 "".join(f'<div class="rline">{_esc(l)}</div>' for l in lines)))
+        html = f'<div class="fsec"><div class="chead">{_pill(f, f + tag)}</div></div>'
+        for c in cards:                               # 함락=전력 변화 표 카드(U-008), 그 외=일반 카드
+            if any(_CAPTURE_RE.search(l) for l in c["lines"]):
+                html += _capture_card(s, c["lines"], FCOLOR.get(f, "#666"), pre)
+            else:
+                html += _render_rescard(c["lines"], FCOLOR.get(f, "#666"))
+        if lines:                                     # 소소한 결과=한 카드 묶음(위계 3티어, 제목 인간화=U-005)
+            html += ('<div class="rescard" style="border-left-color:%s">%s</div>'
+                     % (FCOLOR.get(f, "#666"),
+                        "".join(f'<div class="rline">{_esc(_humanize(l))}</div>' for l in lines)))
+        return html
+
+    order = ([player] if player else []) + [f for f in FACTIONS if f != player]
+    for f in order:
+        html = _faction_html(f)
+        if html:
+            H(f'<div class="mine">{html}</div>' if f == player else html)   # ⭐내 세력 하이라이트
+        if f == player and player and not st.session_state.over:
+            _decision_area(s, player)                 # ⭐U-007: 결정 카드=내 세력 직후·타 세력 앞
     stray = [c for c in op_cards.values() if c["faction"] not in FACTIONS]
     if misc or stray:
         H('<div class="fsec"><div class="chead"><span class="mpill">그 외</span></div></div>')
@@ -1435,21 +1620,23 @@ def results_screen() -> None:
             H(_render_rescard(c["lines"], "#444c5c"))
         if misc:
             H('<div class="rescard">%s</div>'
-              % "".join(f'<div class="rline">{_esc(l)}</div>' for l in misc))
+              % "".join(f'<div class="rline">{_esc(_humanize(l))}</div>' for l in misc))
     if not st.session_state.events:
         st.text("(변화 없음)")
-    if st.session_state.eco:                          # ⭐경제 요약 줄(목업 ecoline)
+    if st.session_state.eco:                          # ⭐경제 요약 줄 — 위험 도시 우선(총합만으론 행동 못 정함)
         dg, df_, secs = st.session_state.eco
         alerts = [f"⚠ {n} 군량 {r}개월" for n, c in s.cities.items() if c.owner == player
                   and (r := food_runway(s, n)) is not None and r <= FOOD_ALERT_MONTHS]
         H('<div class="ecoline">'
           + f"<span>금 {dg:+,}</span><span>군량 {df_:+,}</span>"
           + "".join(f'<span class="neg">{a}</span>' for a in alerts)
-          + f'<span class="grow"></span><span>턴 소요 {secs:.0f}s</span></div>')
-    with st.expander("전체 로그(원문)"):
-        st.text("\n".join(st.session_state.events) or "(변화 없음)")
+          + '<span class="grow"></span></div>')
     for r in st.session_state.retorts:
         st.chat_message("assistant").write(r)
+    with st.expander("🛠 개발 정보 (시드·로그)"):       # ⭐U-005: 게임 문구와 개발·평가 문구 분리
+        secs = st.session_state.eco[2] if st.session_state.eco else None
+        st.caption(f"시드 {s.seed}" + (f" · 턴 소요 {secs:.0f}s" if secs is not None else ""))
+        st.text("\n".join(st.session_state.events) or "(변화 없음)")
 
     if st.session_state.over:
         st.header(st.session_state.over)
@@ -1458,63 +1645,16 @@ def results_screen() -> None:
             st.rerun()
         return
 
-    # 처분 3지선다(⭐결과 창) — resolve_dispositions(player=)가 남긴 큐 소비
-    my_captives = [(c, p) for c, p in s.pending_captives
-                   if s.cities.get(c) and s.cities[c].owner == player]
-    if my_captives:
-        H('<div class="phead">포로 처분</div>')
-        st.caption("새로 사로잡은 포로입니다. 설득은 다음 달 담화에서 할 수 있습니다.")
-        for city_n, p in my_captives:
-            g = s.generals.get(p)
-            c0, c1, c2, c3 = st.columns([3, 1, 1, 1])
-            ruler = bool(g and g.is_ruler and s.factions.get(g.faction) and s.factions[g.faction].alive)
-            c0.text(f"{p} ({city_n}, 원 소속 {g.faction if g else '미상'}"
-                    + (", 군주! — 석방/처형만" if ruler else "") + ")")
-            for col, choice in ((c1, "석방"), (c2, "수감"), (c3, "처형")):
-                if choice == "수감" and ruler:        # ⭐군주=2지선다(§9-21 복원) — 수감 버튼 미노출
-                    continue
-                if col.button(choice, key=f"disp_{city_n}_{p}_{choice}"):
-                    apply_disposition(s, city_n, p, choice)
-                    s.pending_captives.remove((city_n, p))
-                    st.rerun()
-
-    # 외교 제안 응답(버튼=판정, 대사=서사 — ⭐대사 입력 시에만 AI 응수 소호출)
-    my_props = [p for p in s.proposals if p.to_faction == player]
-    if my_props:                                      # ⭐영역 구분(사용자 2026-09-06): 서브타이틀 + 패널 카드
-        H('<div class="phead">외교 제안</div>')
-    for i, prop in enumerate(my_props):
-        detail = {"동맹": "동맹 제안", "항복권유": "항복 권유 — 수락하면 나라를 넘기고 패배합니다",
-                  "포로반환": f"포로 {prop.prisoner} 반환 요청(몸값 금{prop.offer_gold}·식{prop.offer_food})"
-                  }[prop.proposal]
-        with st.container(border=True):
-            st.markdown(_pill(prop.from_faction, small=True)
-                        + f" **{prop.from_faction}의 {detail}**"
-                        + (f" · 사신 {prop.envoy}" if prop.envoy else ""), unsafe_allow_html=True)
-            if prop.message:
-                st.markdown(f"> {prop.message}")
-            say = st.text_input("답신 한마디(선택 — 상대가 읽고 응수합니다)", max_chars=50,
-                                key=f"say_{prop.from_faction}_{prop.proposal}_{prop.prisoner}")  # 인덱스 키=텍스트 상속 버그
-            c1, c2 = st.columns(2)
-            for col, accept in ((c1, True), (c2, False)):
-                if col.button("수락" if accept else "거절", key=f"resp{i}_{accept}",
-                              use_container_width=True):
-                    respond_proposal(s, prop, accept, say)
-                    if say:                           # 옵트인 응수: 판정 이후, 결과 영향 0
-                        ruler = s.factions[prop.from_faction].ruler
-                        fb = ParleyReply(text="…… (사신이 말없이 물러간다)")
-                        r = structured_complete(ParleyReply, load_prompt("ruler_retort").format(
-                            ruler=ruler, faction=prop.from_faction, target=player,
-                            proposal=prop.proposal, verdict="수락" if accept else "거절"),
-                            f"{player} 군주의 답신: {say}", fallback=fb)
-                        st.session_state.retorts.append(f"**{ruler}**: {r.text}")
-                    if accept and prop.proposal == "항복권유":
-                        st.session_state.over = f"패배 — {prop.from_faction}에 항복"
-                    st.rerun()
-
+    # ⭐U-007 정책(⭐사용자 확정 "그 때 눌러야지"): 결정 강제 — 남아 있으면 진행 잠금+사유
+    ndec = (len([1 for c, p in s.pending_captives
+                 if s.cities.get(c) and s.cities[c].owner == player])
+            + len([1 for p in s.proposals if p.to_faction == player])) if player else 0
     st.divider()
-    if st.button("다음 달로", type="primary"):
+    if st.button(f"{s.month}월 명령으로", type="primary", disabled=ndec > 0):   # ⭐U-010: 절대 월
         st.session_state.mode = "play"
         st.rerun()
+    if ndec:
+        st.caption(f"위의 결정 {ndec}건을 먼저 처리해야 넘어갈 수 있습니다.")
 
 
 # ======================= 라우팅 =======================
@@ -1527,7 +1667,7 @@ with st.sidebar:
     st.title("삼국지 LLM")
     if st.session_state.mode != "setup":
         who = st.session_state.player or "관전"
-        st.caption(f"모드: {who} · 시드 {S().seed}")
+        st.caption(f"모드: {who}")                     # ⭐U-005: 시드=개발 정보 접기로 이동
         # ⭐마찰 13: 서사 토글을 게임 중에도(사이드바) — key 바인딩으로 세션 상태와 동기
         st.toggle("소설풍 턴 서사", key="narrate", help="매달 사관이 소설풍 기록을 남깁니다. 다음 결과 창부터 반영됩니다.")
         if st.button("📖 룰북"):

@@ -47,6 +47,28 @@ def test_app_full_turn_offline():
         s = at.session_state["state"]
         assert (s.year, s.month) == (0, 2)
 
-        # 결과 창 → 다음 달(플레이 화면 복귀)
-        at = _click(at, "다음 달로")
+        # 결과 창 → 다음 달(플레이 화면 복귀) — ⭐U-010: 버튼 라벨="{N}월 명령으로"
+        at = _click(at, "명령으로")
+        assert not at.exception and at.session_state["mode"] == "play"
+
+
+def test_results_decision_gate_offline():
+    """⭐U-007(사용자 확정 '그 때 눌러야지'): 결정 미처리=진행 잠금, 처리 후 진행 가능."""
+    from src.models import Proposal
+    with patch("src.decide.structured_complete", side_effect=_fake_complete):
+        at = AppTest.from_file(APP).run(timeout=60)
+        at = _click(at, "게임 시작")
+        s = at.session_state["state"]
+        s.proposals.append(Proposal(from_faction="촉", to_faction="위", proposal="동맹", months=6))
+        for k, v in (("mode", "results"), ("events", []), ("eco", None),
+                     ("retorts", []), ("narration", None), ("decided", [])):
+            at.session_state[k] = v
+        at = at.run(timeout=60)
+        at = _click(at, "명령으로")                     # 결정 1건 미처리 → 잠김(무시됨)
+        assert at.session_state["mode"] == "results"
+        at.button(key="resp0_True").click()             # 동맹 수락
+        at = at.run(timeout=60)
+        assert any(set(p) == {"위", "촉"} for p in at.session_state["state"].alliances)
+        assert at.session_state["decided"]              # ⭐U-002: 처리 완료 피드백 기록
+        at = _click(at, "명령으로")                     # 결정 소진 → 진행
         assert not at.exception and at.session_state["mode"] == "play"
