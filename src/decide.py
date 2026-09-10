@@ -55,6 +55,16 @@ def _judged_texts(state: GameState, actions: dict) -> dict[tuple[str, str], list
     군량 조건 과일반화 B6)의 근본 수리. 전략변경 줄에도 명단 포함(신규 출격과 동형).
     """
     from .engine import _city_threats, food_net       # 지연 임포트(단방향: engine은 decide를 모름)
+
+    def battle_line(mode, origin, target, troops, gens, stage=None):
+        # R-011: 신규 출격·전략변경이 **같은 사실 포매터**를 쓴다 — 목표 소유·수비·거리·명단 동등 보장.
+        tc = state.cities.get(target)
+        d = state.distances.get(origin, {}).get(target)
+        tgt = f"{target}({tc.owner}·수비 {tc.troops})" if tc is not None else target
+        return (f"{mode} {origin}→{tgt}" + (f"({stage})" if stage else "")
+                + (f" 거리{d}개월" if d and origin != target else "")
+                + f" 병{troops} 투입장수[{','.join(gens) if gens else '없음'}]")
+
     out: dict[tuple[str, str], list[tuple[str, str]]] = {}
     seen: set[int] = set()                            # R-006 3차: pydantic 파싱이 같은 내용의 전략문에
     for faction, acts in actions.items():             # **동일 str 객체를 재사용**(Codex 검증) → 객체 결속이
@@ -69,20 +79,13 @@ def _judged_texts(state: GameState, actions: dict) -> dict[tuple[str, str], list
             if a.kind == "전투":
                 # ⭐투입 장수 노출(2026-09-06, 사용자 발견): 전략문이 부대에 없는 장수에게 역할을 주는
                 # "유령 장수" 계획을 심판이 글만 보고 수긍 → 명단을 채점 줄에 박아 대조 가능하게.
-                tc = state.cities.get(a.target)
-                d = state.distances.get(a.origin, {}).get(a.target)
-                tgt = f"{a.target}({tc.owner}·수비 {tc.troops})" if tc is not None else a.target
-                ctx = (f"{a.mode} {a.origin}→{tgt}"
-                       + (f" 거리{d}개월" if d and a.origin != a.target else "")
-                       + f" 병{a.troops} 투입장수[{','.join(a.generals) if a.generals else '없음'}]")
+                ctx = battle_line(a.mode, a.origin, a.target, a.troops, a.generals)
             elif a.kind == "작전지시" and a.order == "전략변경":
                 op = next((o for o in state.operations if o.id == a.op_id), None)
                 if op is not None and op.faction == faction:   # ⭐마찰 52②: 전략변경도 부대 사실 동봉
-                    tc = state.cities.get(op.action.target)
-                    tgt = f"{op.action.target}({tc.owner})" if tc is not None else op.action.target
-                    ctx = (f"작전{a.op_id} 전략변경 — {op.action.mode} {op.action.origin}→{tgt}"
-                           f"({op.stage}) 병{op.committed_troops} 투입장수"
-                           f"[{','.join(op.committed_generals) if op.committed_generals else '없음'}]")
+                    ctx = f"작전{a.op_id} 전략변경 — " + battle_line(
+                        op.action.mode, op.action.origin, op.action.target,
+                        op.committed_troops, op.committed_generals, stage=op.stage)
                 else:
                     ctx = f"작전{a.op_id} 전략변경"
             elif a.kind == "내정":

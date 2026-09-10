@@ -2,7 +2,8 @@
 import src.decide as decide
 from src.config import MATCHUP_MODIFIER_BOUND
 from src.engine import advance_turn
-from src.models import Battle, City, Domestic, Faction, GameState, General
+from src.models import (ActiveOperation, Battle, City, Domestic, Faction,
+                        GameState, General, OpCommand)
 
 
 def _state(seed: int = 0) -> GameState:
@@ -127,3 +128,17 @@ def test_battle_ctx_exposes_committed_generals():
     ctx = items[0][1]
     assert "투입장수[조운]" in ctx
     assert "낙양(위·수비 20000)" in ctx and "거리2개월" in ctx   # 사실표: 목표 소유·수비·거리
+
+
+def test_strategy_change_ctx_same_facts_as_new_battle():
+    """⭐R-011: 전략변경 채점 줄도 신규 출격과 같은 사실 포매터 — 목표 소유·수비·거리·명단 동등."""
+    s = _state()
+    s.operations.append(ActiveOperation(
+        id=7, faction="위", stage="이동", progress=0, threshold=2,
+        committed_troops=8000, committed_generals=["장료"],
+        action=Battle(kind="전투", mode="공성", origin="낙양", target="성도", troops=8000)))
+    acts = {"위": [OpCommand(kind="작전지시", op_id=7, order="전략변경", strategy="새 전술")]}
+    (_, items), = decide._judged_texts(s, acts).items()
+    ctx = items[0][1]
+    for frag in ("성도(촉·수비 15000)", "거리2개월", "투입장수[장료]", "(이동)", "병8000"):
+        assert frag in ctx
