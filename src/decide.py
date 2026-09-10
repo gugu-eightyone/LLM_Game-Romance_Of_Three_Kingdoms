@@ -56,11 +56,16 @@ def _judged_texts(state: GameState, actions: dict) -> dict[tuple[str, str], list
     """
     from .engine import _city_threats, food_net       # 지연 임포트(단방향: engine은 decide를 모름)
     out: dict[tuple[str, str], list[tuple[str, str]]] = {}
-    for faction, acts in actions.items():
-        for a in (acts if isinstance(acts, list) else [acts]):
-            text = getattr(a, "strategy", "")
+    seen: set[int] = set()                            # R-006 3차: pydantic 파싱이 같은 내용의 전략문에
+    for faction, acts in actions.items():             # **동일 str 객체를 재사용**(Codex 검증) → 객체 결속이
+        for a in (acts if isinstance(acts, list) else [acts]):   # 무너짐. 여기서 중복 객체를 내용 동일한
+            text = getattr(a, "strategy", "")         # 새 객체로 교체해 명령당 1객체 불변식을 복원한다.
             if not text:
                 continue
+            if id(text) in seen:
+                text = text.encode("utf-8").decode("utf-8")   # 내용 동일·확실한 새 객체
+                a.strategy = text
+            seen.add(id(text))
             if a.kind == "전투":
                 # ⭐투입 장수 노출(2026-09-06, 사용자 발견): 전략문이 부대에 없는 장수에게 역할을 주는
                 # "유령 장수" 계획을 심판이 글만 보고 수긍 → 명단을 채점 줄에 박아 대조 가능하게.

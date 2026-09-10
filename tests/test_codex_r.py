@@ -161,17 +161,27 @@ def test_surrender_frees_prisoners_in_winner_jails():
 # ---------- R-006 + R-010: 심판 캐시 키 충돌 · 폴백 정보 집합 ----------
 
 def test_same_strategy_text_scores_bind_per_action(monkeypatch):
-    """같은 내용의 전략문 2건 — 점수가 각 명령의 전략문 객체에 결속(덮어쓰기·순서 밀림 없음)."""
+    """같은 내용의 전략문 2건 — 점수가 각 명령에 결속(덮어쓰기·순서 밀림 없음).
+
+    ⭐R-006 3차(Codex 재재검증 반례): 실제 구조화 출력 경로(model_validate_json)는 같은 내용의
+    전략문에 **동일 str 객체를 재사용**한다 — 그 조건 그대로 파싱해서 검증한다.
+    """
+    import json
+
+    from src.decide import Decision
     s = _state(허창=City(name="허창", owner="위", troops=10000),
                완=City(name="완", owner="촉", troops=100),
                섭=City(name="섭", owner="촉", troops=100))
     monkeypatch.setattr("src.decide.structured_complete",
                         lambda *a, **k: JudgeScores(scores=[JudgeScore(score=2), JudgeScore(score=10)]))
-    same = lambda: "".join(["같은", " 글"])              # 내용 동일·객체 별개(리터럴 폴딩 회피)
-    a1 = Battle(kind="전투", mode="공성", origin="허창", target="완", troops=100, strategy=same())
-    a2 = Battle(kind="전투", mode="공성", origin="허창", target="섭", troops=9000, strategy=same())
-    judge = turn_judge(s, {"위": [a1, a2]})
-    assert judge(s, "위", "전투", a1.strategy)[0] == 2   # 수리 전: 둘 다 10(덮어쓰기)
+    d = Decision.model_validate_json(json.dumps({"actions": [
+        {"kind": "전투", "mode": "공성", "origin": "허창", "target": "완",
+         "troops": 100, "generals": [], "strategy": "같은 글"},
+        {"kind": "전투", "mode": "공성", "origin": "허창", "target": "섭",
+         "troops": 9000, "generals": [], "strategy": "같은 글"}]}))
+    a1, a2 = d.actions
+    judge = turn_judge(s, {"위": [a1, a2]})              # 내부에서 중복 객체를 분리(불변식 복원)
+    assert judge(s, "위", "전투", a1.strategy)[0] == 2   # 수리 전: pydantic 객체 공유로 둘 다 10
     assert judge(s, "위", "전투", a2.strategy)[0] == 10
 
 
