@@ -28,8 +28,14 @@ def test_app_full_turn_offline():
         assert not at.exception and at.session_state["mode"] == "play"
         assert len(at.session_state["state"].cities) == 16
 
-        # 내정 명령 추가(기본값 금 0 = 상태 무변). segmented_control 탭이라 먼저 내정으로 전환
+        # 내정 명령 추가. segmented_control 탭이라 먼저 내정으로 전환.
+        # ⭐U-006: 금 0(효과 없음)은 추가 버튼이 막힘 — 유효 투입으로 확인 + 가드 자체도 검증
         at.session_state["order_tab"] = "내정"
+        at = at.run(timeout=60)
+        at.button(key="d_add").click()                 # 기본값 0 → 가드에 막혀 추가 안 됨
+        at = at.run(timeout=60)
+        assert len(at.session_state["orders"]) == 0
+        at.number_input(key="d_g").set_value(100)
         at = at.run(timeout=60)
         at.button(key="d_add").click()
         at = at.run(timeout=60)

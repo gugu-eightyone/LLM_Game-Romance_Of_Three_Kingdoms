@@ -79,13 +79,15 @@ def _two_battles():
 
 
 def test_turn_judge_batches_one_call_and_falls_back_on_miss(monkeypatch):
+    """⭐R-006 2차 계약: 점수는 각 명령의 전략문 객체에 결속 — 엔진처럼 액션의 원본 str로 조회한다."""
     s = _state()
     fake, calls = _fake_llm([8, 3])
     monkeypatch.setattr(decide, "structured_complete", fake)
-    judge = decide.turn_judge(s, _two_battles())
+    acts = _two_battles()
+    judge = decide.turn_judge(s, acts)
     assert calls["batch"] == 1                          # 2건 → 1호출
-    assert judge(s, "촉", "전투", "동벽 견제") == (8, "r")
-    assert judge(s, "촉", "전투", "서벽 주공") == (3, "r")
+    assert judge(s, "촉", "전투", acts["촉"][0].strategy) == (8, "r")
+    assert judge(s, "촉", "전투", acts["촉"][1].strategy) == (3, "r")
     assert calls["single"] == 0                         # 캐시 적중=추가 호출 없음
     assert judge(s, "촉", "전투", "배치에 없던 전략")[0] == 5  # 미스 → 단건 폴백
     assert calls["single"] == 1
@@ -95,8 +97,9 @@ def test_turn_judge_length_mismatch_falls_back(monkeypatch):
     s = _state()
     fake, calls = _fake_llm([8])                        # 2건 요청에 1점만 반환
     monkeypatch.setattr(decide, "structured_complete", fake)
-    judge = decide.turn_judge(s, _two_battles())
-    assert judge(s, "촉", "전투", "동벽 견제")[0] == 5   # 불일치 → 캐시 폐기, 단건 폴백
+    acts = _two_battles()
+    judge = decide.turn_judge(s, acts)
+    assert judge(s, "촉", "전투", acts["촉"][0].strategy)[0] == 5   # 불일치 → 캐시 폐기, 단건 폴백
     assert calls["single"] == 1
 
 
@@ -106,16 +109,21 @@ def test_turn_judge_single_item_also_batched(monkeypatch):
     s = _state()
     fake, calls = _fake_llm([9])
     monkeypatch.setattr(decide, "structured_complete", fake)
-    judge = decide.turn_judge(s, {"촉": [Domestic(kind="내정", city="성도", item="모병",
-                                                  gold_spent=1000, strategy="정예 위주 소수 모병")]})
+    dom = Domestic(kind="내정", city="성도", item="모병",
+                   gold_spent=1000, strategy="정예 위주 소수 모병")
+    judge = decide.turn_judge(s, {"촉": [dom]})
     assert calls["batch"] == 1                          # 단건도 일괄 1호출(총 호출 수 무변)
-    assert judge(s, "촉", "내정", "정예 위주 소수 모병") == (9, "r")   # 캐시 적중
+    assert judge(s, "촉", "내정", dom.strategy) == (9, "r")   # 캐시 적중(객체 결속)
     assert calls["single"] == 0
 
 
 def test_battle_ctx_exposes_committed_generals():
-    """유령 장수 대조 재료: 채점 줄에 투입장수 명단이 박힌다(⭐2026-09-06 사용자 발견 수리)."""
+    """유령 장수 대조 재료: 채점 줄에 투입장수 명단+계산된 사실(목표 소유·수비·거리)이 박힌다
+    (⭐2026-09-06 명단 + 2026-09-10 사실표 주입)."""
+    s = _state()
     acts = {"촉": [Battle(kind="전투", mode="공성", origin="성도", target="낙양",
                           troops=4000, generals=["조운"], strategy="북벽 강습")]}
-    (_, items), = decide._judged_texts(acts).items()
-    assert "투입장수[조운]" in items[0][1]
+    (_, items), = decide._judged_texts(s, acts).items()
+    ctx = items[0][1]
+    assert "투입장수[조운]" in ctx
+    assert "낙양(위·수비 20000)" in ctx and "거리2개월" in ctx   # 사실표: 목표 소유·수비·거리

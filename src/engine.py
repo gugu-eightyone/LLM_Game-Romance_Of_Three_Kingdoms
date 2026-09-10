@@ -253,8 +253,11 @@ def start_operation(state: GameState, action: Battle, actor: str | None = None,
         state.history.append(f"[기각] {action.origin} 가용 병력 0")
         return None
 
-    valid = [g for g in action.generals if g in origin.generals]
-    dropped = [g for g in action.generals if g not in origin.generals]
+    wanted = list(dict.fromkeys(action.generals))     # R-003: 중복 기재 → 1명으로(중복 remove 크래시·반쪽 상태 방지)
+    if len(wanted) < len(action.generals):
+        state.history.append(f"[환각] {faction} 출격 장수 중복 기재 → 중복 제거")
+    valid = [g for g in wanted if g in origin.generals]
+    dropped = [g for g in wanted if g not in origin.generals]
     if dropped:
         state.history.append(f"[환각] {faction} 미보유/타지 장수 {dropped} 제외")
 
@@ -310,6 +313,9 @@ def apply_domestic(state: GameState, action: Domestic, actor: str | None = None,
         return
     if actor is not None and city.owner != actor:
         state.history.append(f"[위반] {actor}가 남의 도시 '{action.city}'({city.owner}) 내정 시도 → 기각")
+        return
+    if action.gold_spent < 0:                         # R-002: 음수 지출=금 생성+math domain error → 상태 변경 전 기각
+        state.history.append(f"[환각] {city.owner} {action.city} {action.item} 투입 금 음수({action.gold_spent}) → 기각")
         return
     gen = None                                        # ⭐담당 장수: 그 도시 주둔만 유효(무효=제외 로깅, 배수 1.0)
     if action.general:
@@ -395,9 +401,13 @@ def start_transfer(state: GameState, action: Transfer, actor: str | None = None)
     food = max(0, min(action.food, origin.food))
     if (troops, gold, food) != (action.troops, action.gold, action.food):
         state.history.append(f"[환각] {faction} 호송 적재량이 보유 초과/음수 → 클램프")
-    gens = [g for g in action.generals if g in origin.generals]
-    pris = [p for p in action.prisoners if p in origin.prisoners]
-    dropped = [x for x in (*action.generals, *action.prisoners) if x not in (*gens, *pris)]
+    w_gens = list(dict.fromkeys(action.generals))     # R-003: 출격과 같은 중복 처리 원칙(호송 장수·포로)
+    w_pris = list(dict.fromkeys(action.prisoners))
+    if len(w_gens) < len(action.generals) or len(w_pris) < len(action.prisoners):
+        state.history.append(f"[환각] {faction} 호송 장수/포로 중복 기재 → 중복 제거")
+    gens = [g for g in w_gens if g in origin.generals]
+    pris = [p for p in w_pris if p in origin.prisoners]
+    dropped = [x for x in (*w_gens, *w_pris) if x not in (*gens, *pris)]
     if dropped:
         state.history.append(f"[환각] {faction} 호송 미보유 장수/포로 {dropped} 제외")
     if not (troops or gold or food or gens or pris):
@@ -670,6 +680,8 @@ def _siege_round(state: GameState, op: ActiveOperation) -> None:
     공성 주체가 바뀌어도(3파전) 물리적으로 정당하게 이어진다(구 "진행도 승계" 구멍 해소).
     공격=부대 사기(op.unit_morale), 수비=전역 사기(수성=작전 아님 → 세력값). 전멸/퇴각은 `_resolve_op_end`.
     """
+    if op not in state.operations:                    # R-001: 같은 턴 앞선 함락(멸망 투항 흡수 등)으로 이미
+        return                                        # 제거된 작전 — 복사본 순회가 넘겨도 재실행 금지
     city = state.cities.get(op.action.target)
     if city is None:
         state.operations.remove(op)
@@ -801,7 +813,9 @@ def _succeed_ruler(state: GameState, faction: str) -> None:
 
     ⭐후보 = 세력 소속 전체(출전 중 포함, 수감·처형자 제외) — 도시 주둔만 집계하면 전 장수 출전 중일 때
     ruler=""가 영구 공석이 되는 구멍(2026-09-01 전수조사)."""
-    jailed = {p for c in state.cities.values() for p in c.prisoners}
+    jailed = {p for c in state.cities.values() for p in c.prisoners} \
+        | {p for o in state.operations for p in o.cargo_prisoners}   # R-007: 이감 중 포로도 수감자
+
     cand = [g.name for g in state.generals.values()
             if g.faction == faction and g.name not in jailed]
     if not cand:                                     # 승계할 장수 없음(전원 수감/사망)
@@ -914,6 +928,8 @@ def _resolve_combat(state: GameState, matchup: "MatchupFn | None" = None) -> Non
     n_opp: dict[int, int] = {}
     killers: dict[int, str] = {}                     # 궤멸 op → 마지막 타격 세력(전리품 귀속, ⭐2026-09-01)
     for a, b in pairs:
+        if a.id in killers or b.id in killers:        # R-005: 앞선 쌍에서 이미 전멸한 부대 — 무효 교전으로
+            continue                                  # 격멸자 덮어쓰기·교전 수(포획확률) 부풀림 방지
         ma, mb = _matchup_mods(state, a, b, matchup)  # ⭐상성(쌍당 1회 캐시, 무전략=0·호출 0)
         _field_round(state, a, b, killers, ma, mb)
         n_opp[a.id] = n_opp.get(a.id, 0) + 1
@@ -1018,6 +1034,34 @@ def _strand_general(state: GameState, op: ActiveOperation, g: str) -> None:
         state.history.append(f"  ↳ {g} 고립 포로 → {jail}")
 
 
+def _free_captive(state: GameState, op: ActiveOperation, p: str, jail: str | None = None) -> None:
+    """호송 붕괴·고립 시 화물 포로의 최후 처리(⭐무증발 원칙 — R-008): 반드시 어딘가에 남는다.
+
+    우선순위: ①인접 원 세력 도시로 해방 ②jail(격멸자 감옥 — 요격 노획 관례) ③전국 원 세력 도시로 해방
+    ④호송 주체(op.faction)의 아무 도시에 재수감 ⑤아무 적성 도시에 재수감. _strand_general의 포로판.
+    """
+    pf = state.generals[p].faction if p in state.generals else ""
+    near = _nearest_city_of(state, op, pf)
+    if near:
+        state.cities[near].generals.append(p)
+        state.history.append(f"  ↳ 포로 {p} 해방 → {near}")
+        return
+    if jail:
+        state.cities[jail].prisoners.append(p)        # 요격측 재수감(기존 노획 관례 유지)
+        return
+    far = next((n for n in sorted(state.cities) if state.cities[n].owner == pf), None)
+    if far:
+        state.cities[far].generals.append(p)
+        state.history.append(f"  ↳ 포로 {p} 구사일생 해방 → {far}")
+        return
+    hold = next((n for n in sorted(state.cities) if state.cities[n].owner == op.faction), None) \
+        or next((n for n in sorted(state.cities)
+                 if state.cities[n].owner not in (pf, "중립")), None)
+    if hold:
+        state.cities[hold].prisoners.append(p)
+        state.history.append(f"  ↳ 포로 {p} 재수감 → {hold}")
+
+
 def _return_home(state: GameState, op: ActiveOperation, reason: str, troops: bool = True) -> None:
     """출격/작전 종료 → 생존군·장수 아군 도시 복귀. 고립(복귀지 없음)=포로 해방+소실 로깅(무로그 증발 금지)."""
     dest = _home_city(state, op)
@@ -1031,11 +1075,7 @@ def _return_home(state: GameState, op: ActiveOperation, reason: str, troops: boo
         c.prisoners.extend(op.cargo_prisoners)
     else:
         for p in op.cargo_prisoners:                  # 호송 중 포로=해방(전멸 경로와 일관 — 호송자가 무너지면 풀려남)
-            pf = state.generals[p].faction if p in state.generals else ""
-            free = _nearest_city_of(state, op, pf)
-            if free:
-                state.cities[free].generals.append(p)
-                state.history.append(f"  ↳ 포로 {p} 해방 → {free}")
+            _free_captive(state, op, p)               # R-008: 인접에 수용처 없어도 전국 폴백(무증발)
         for g in op.committed_generals:               # 장수=구사일생/고립 포로(무증발 원칙, ⭐"행방불명 기분 나쁨")
             _strand_general(state, op, g)
         far = next((n for n in sorted(state.cities) if state.cities[n].owner == op.faction), None)
@@ -1120,13 +1160,7 @@ def _destroy_field_op(state: GameState, op: ActiveOperation, n_field: int,
         state.cities[jail].food += op.cargo_food
         state.history.append(f"  ↳ 화물 노획(금{op.cargo_gold}·식{op.cargo_food}) → {jail}")
     for p in op.cargo_prisoners:                      # 호송 중 포로 = 해방 → 원 세력 최근접 도시
-        pf = state.generals[p].faction if p in state.generals else ""
-        free = _nearest_city_of(state, op, pf)
-        if free:
-            state.cities[free].generals.append(p)
-            state.history.append(f"  ↳ 포로 {p} 해방 → {free}")
-        elif jail:                                    # 원 세력 도시 없음(소멸 등) → 재수감
-            state.cities[jail].prisoners.append(p)
+        _free_captive(state, op, p, jail)             # R-008: jail도 없고 인접 해방지도 없으면 전국 폴백(무증발)
     state.history.append(f"[야전 전멸] {op.faction} 작전{op.id} 궤멸")
     state.operations.remove(op)
 
@@ -1296,6 +1330,10 @@ def apply_diplomacy(state: GameState, action: Diplomacy, actor: str | None = Non
             state.history.append(
                 f"[환각] {me} 반환 요청 무효('{action.prisoner}'는 {t} 수감 중인 아군 아님) → 기각")
             return
+        if action.offer_gold < 0 or action.offer_food < 0:   # R-002: 음수 몸값=역방향 자원 이전 → 기각
+            state.history.append(
+                f"[환각] {me} 몸값 음수(금{action.offer_gold}·식{action.offer_food}) → 기각")
+            return
         pay_city = getattr(action, "pay_city", "")    # ⭐지불 도시 지정(플레이어 UI). 무효 지정=자동으로 강등
         if pay_city and (pay_city not in state.cities or state.cities[pay_city].owner != me):
             state.history.append(f"[환각] {me} 몸값 지불 도시 '{pay_city}' 무효(타국/부재) → 자동 선택")
@@ -1373,9 +1411,14 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
         if lf is None or not lf.alive:
             state.history.append(f"[외교] {b} 항복 무산(세력 소멸)")
             return False
-        for op2 in [o for o in state.operations if o.faction == b]:   # 출전 부대 해산 → 가까운 도시로 귀속
-            c = state.cities.get(op2.action.origin) or state.cities.get(op2.action.target)
-            if c is not None:
+        b_cities = sorted(n for n, c in state.cities.items() if c.owner == b)
+        for op2 in [o for o in state.operations if o.faction == b]:   # 출전 부대 해산 → 항복 세력 도시로 귀속
+            # R-004: 도시 존재만 보면 제3세력 도시에 합류(소유권 불일치) — 현 소유가 b인 곳만, 없으면 아무 b 도시
+            dest = next((n for n in (op2.action.origin, op2.action.target)
+                         if n in state.cities and state.cities[n].owner == b),
+                        b_cities[0] if b_cities else None)
+            if dest is not None:
+                c = state.cities[dest]
                 c.troops += max(0, op2.committed_troops)
                 c.generals.extend(op2.committed_generals)
                 c.prisoners.extend(op2.cargo_prisoners)
@@ -1389,8 +1432,16 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
             if g.faction == b:
                 g.faction = a
                 g.is_ruler = False                    # 항복 군주 = 승자의 신하(일개 장수)
-        for c in taken:                               # 흡수한 감옥 정리: a 소속(구 b 포함) 포로 해방(⭐2026-09-01)
-            _liberate_prisoners(state, c)
+        for c in state.cities.values():               # 감옥 정리: 흡수 도시뿐 아니라 승자 기존 감옥의
+            if c.owner == a:                          # 구 b 포로도 이제 아군 — 해방(R-009)
+                _liberate_prisoners(state, c)
+        for op2 in state.operations:                  # R-009: 승자의 이감 중 화물 포로도 같은 원칙 — 호위로 합류
+            if op2.faction == a:
+                for p in [x for x in op2.cargo_prisoners
+                          if x in state.generals and state.generals[x].faction == a]:
+                    op2.cargo_prisoners.remove(p)
+                    op2.committed_generals.append(p)
+                    state.history.append(f"  ↳ 아군 포로 {p} 해방(호송 중 합류)")
         lf.alive = False
         state.alliances = [p for p in state.alliances if b not in p]
         state.alliance_expires = {k: v for k, v in state.alliance_expires.items()
@@ -1409,7 +1460,8 @@ def respond_proposal(state: GameState, prop: Proposal, accept: bool, reason: str
     else:
         payer_g = max((c for c in state.cities.values() if c.owner == a), key=lambda c: c.gold, default=None)
         payer_f = max((c for c in state.cities.values() if c.owner == a), key=lambda c: c.food, default=None)
-    if (jail is None or payer_g is None or payer_g.gold < prop.offer_gold
+    if (jail is None or prop.offer_gold < 0 or prop.offer_food < 0   # R-002: 수제 제안(세이브 등) 방어
+            or payer_g is None or payer_g.gold < prop.offer_gold
             or payer_f is None or payer_f.food < prop.offer_food):
         state.history.append(f"[외교] {prop.prisoner} 반환 무산(포로 부재 또는 몸값 여력 소진)")
         return False

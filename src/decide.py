@@ -46,8 +46,15 @@ class JudgeScores(BaseModel):
     scores: list[JudgeScore]
 
 
-def _judged_texts(actions: dict) -> dict[tuple[str, str], list[tuple[str, str]]]:
-    """(세력, 심판종류) → [(전략문, 행동 한줄)]. 엔진이 채점하는 집합과 동일(전투=출격·전략변경 / 내정)."""
+def _judged_texts(state: GameState, actions: dict) -> dict[tuple[str, str], list[tuple[str, str]]]:
+    """(세력, 심판종류) → [(전략문, 행동 한줄)]. 엔진이 채점하는 집합과 동일(전투=출격·전략변경 / 내정).
+
+    ⭐사실표 주입(2026-09-10, 마찰 52②·심판 캘리브레이션 — Codex 제안·Claude 동의): 채점 줄에
+    **엔진이 계산한 사실**(목표 소유·수비 병력·거리·투입 장수 명단·도시 수지·피침)을 박는다 —
+    심판이 brief에서 사실을 추론하다 생긴 오폭(실재 지휘관 부재 오판 B8·탈환 목표 오독 B7·
+    군량 조건 과일반화 B6)의 근본 수리. 전략변경 줄에도 명단 포함(신규 출격과 동형).
+    """
+    from .engine import _city_threats, food_net       # 지연 임포트(단방향: engine은 decide를 모름)
     out: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for faction, acts in actions.items():
         for a in (acts if isinstance(acts, list) else [acts]):
@@ -57,12 +64,31 @@ def _judged_texts(actions: dict) -> dict[tuple[str, str], list[tuple[str, str]]]
             if a.kind == "전투":
                 # ⭐투입 장수 노출(2026-09-06, 사용자 발견): 전략문이 부대에 없는 장수에게 역할을 주는
                 # "유령 장수" 계획을 심판이 글만 보고 수긍 → 명단을 채점 줄에 박아 대조 가능하게.
-                ctx = (f"{a.mode} {a.origin}→{a.target} 병{a.troops} "
-                       f"투입장수[{','.join(a.generals) if a.generals else '없음'}]")
+                tc = state.cities.get(a.target)
+                d = state.distances.get(a.origin, {}).get(a.target)
+                tgt = f"{a.target}({tc.owner}·수비 {tc.troops})" if tc is not None else a.target
+                ctx = (f"{a.mode} {a.origin}→{tgt}"
+                       + (f" 거리{d}개월" if d and a.origin != a.target else "")
+                       + f" 병{a.troops} 투입장수[{','.join(a.generals) if a.generals else '없음'}]")
             elif a.kind == "작전지시" and a.order == "전략변경":
-                ctx = f"작전{a.op_id} 전략변경"
+                op = next((o for o in state.operations if o.id == a.op_id), None)
+                if op is not None and op.faction == faction:   # ⭐마찰 52②: 전략변경도 부대 사실 동봉
+                    tc = state.cities.get(op.action.target)
+                    tgt = f"{op.action.target}({tc.owner})" if tc is not None else op.action.target
+                    ctx = (f"작전{a.op_id} 전략변경 — {op.action.mode} {op.action.origin}→{tgt}"
+                           f"({op.stage}) 병{op.committed_troops} 투입장수"
+                           f"[{','.join(op.committed_generals) if op.committed_generals else '없음'}]")
+                else:
+                    ctx = f"작전{a.op_id} 전략변경"
             elif a.kind == "내정":
-                ctx = f"{a.item} {a.city}"
+                c = state.cities.get(a.city)
+                if c is not None:                     # ⭐마찰 48 지원: 수지·피침을 결론으로(심판 추론 금지)
+                    net = food_net(state, a.city)
+                    ctx = (f"{a.item} {a.city}(병{c.troops}·식{c.food}"
+                           + (f"·월{net:+d}" if net is not None else "")
+                           + ("·피침" if _city_threats(state, a.city, c.owner) else "") + ")")
+                else:
+                    ctx = f"{a.item} {a.city}"
             else:
                 continue                              # 계략·설득 등은 각자 서브시스템(여기 채점 아님)
             out.setdefault((faction, "내정" if a.kind == "내정" else "전투"), []).append((text, ctx))
@@ -77,8 +103,16 @@ def turn_judge(state: GameState, actions: dict):
     같은 턴 숨은 수는 의도적으로 안 봄, 카운터는 상성 판정·전략변경 재채점 몫). 캐시 미스·
     실패·길이 불일치는 기존 단건 action_judge로 폴백(악화 없음). 단건도 일괄 경로(투입장수 노출).
     """
-    cache: dict[tuple[str, str, str], tuple[int, str]] = {}
-    for (faction, kind), items in _judged_texts(actions).items():
+    briefs = {f: brief(state, f) for f in actions}    # R-010: 턴 시작 스냅샷 — 폴백도 정상 경로와
+                                                      # 같은 정보 집합(실행 도중 변한 상태 금지, §9 원칙)
+    # R-006(2차 — Codex 재검증 반례 수리): 점수를 전략문 **내용**이 아니라 각 명령의 전략문
+    # **객체(id)**에 결속. 엔진은 항상 액션의 원본 str 객체로 콜백을 부르므로(출격=action.strategy,
+    # 전략변경=OpCommand의 str을 op에 대입 후 채점) 같은 내용의 다른 명령도 각자 점수를 받고,
+    # 앞선 명령이 엔진 가드에서 기각돼 콜백을 소비하지 않아도 뒤 명령의 결속이 밀리지 않는다.
+    # 한계: 호출자가 같은 str 객체를 두 명령에 공유하면 뒤 점수만 남음(JSON 파싱·UI 입력=항상 별개 객체).
+    cache: dict[int, tuple[int, str]] = {}
+    refs: list[str] = []                              # id 키 원본 참조 유지(GC 재사용 방지)
+    for (faction, kind), items in _judged_texts(state, actions).items():
         if not items:
             continue                                  # ⭐단건도 일괄 경로로(2026-09-06): 호출 수 동일(1회),
                                                       # ctx의 투입장수 명단을 심판이 보게 됨(유령 장수 대조)
@@ -86,7 +120,7 @@ def turn_judge(state: GameState, actions: dict):
         try:
             v = structured_complete(
                 JudgeScores, JUDGE_SYSTEMS[kind].format(faction=faction),
-                brief(state, faction)
+                briefs.get(faction, brief(state, faction))
                 + f"\n\n[채점 대상 — {faction}의 이번 턴 {kind} 전략 {len(items)}건. "
                 f"같은 턴에 함께 내려진 한 계획의 부분들이다 — 각각을 계획 전체 맥락에서 채점, "
                 f"scores 배열은 번호 순서대로]\n{listing}")
@@ -95,10 +129,14 @@ def turn_judge(state: GameState, actions: dict):
         if v is None or len(v.scores) != len(items):
             continue                                  # 응답 없음/길이 불일치 → 단건 폴백(안전)
         for (t, _), sc in zip(items, v.scores):
-            cache[(faction, kind, t)] = (sc.score, sc.reason)
+            cache[id(t)] = (sc.score, sc.reason)
+            refs.append(t)
 
     def judge(st: GameState, faction: str, kind: str, text: str) -> tuple[int, str] | None:
-        return cache.get((faction, kind, text)) or action_judge(st, faction, kind, text)
+        v = cache.get(id(text))                       # 객체 결속 — 내용이 같아도 다른 명령이면 미스
+        if v is not None:
+            return v
+        return action_judge(st, faction, kind, text, pre_brief=briefs.get(faction))
     return judge
 
 
@@ -126,10 +164,12 @@ def matchup_judge(state: GameState, ctx: str, fa: str, ta: str,
         return None
 
 
-def action_judge(state: GameState, faction: str, kind: str, text: str) -> tuple[int, str] | None:
+def action_judge(state: GameState, faction: str, kind: str, text: str,
+                 pre_brief: str | None = None) -> tuple[int, str] | None:
     """엔진에 주입하는 심판 콜백(§9-11: kind로 코드 라우팅 → 도메인 특화 심판, 분류 LLM 없음).
 
     채점 근거=정세 브리핑(상태 정합성 채점 → 미사여구 gaming 방어, §9-12). 실패=None(보정 0, 공짜 없음).
+    pre_brief: 턴 시작 스냅샷(R-010) — 주면 실행 도중의 state 대신 이것을 채점 근거로 쓴다.
     """
     system = JUDGE_SYSTEMS.get(kind)
     if system is None:
@@ -137,7 +177,7 @@ def action_judge(state: GameState, faction: str, kind: str, text: str) -> tuple[
     try:
         v = structured_complete(
             JudgeScore, system.format(faction=faction),
-            brief(state, faction) + f"\n\n[채점 대상 {kind} 전략] {text}")
+            (pre_brief or brief(state, faction)) + f"\n\n[채점 대상 {kind} 전략] {text}")
         return v.score, v.reason
     except LLMError:
         return None
